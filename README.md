@@ -17,7 +17,7 @@ Bağımsız bir topluluk projesidir; Metric ile bağlantısı yoktur. Yatırım 
 | Havuzlar / Pools | Filtre (zincir, seviye, TVL, durum, küratör, özel, boş), arama, sıralama (TVL, hacim, 7g APR, Markout APR, Trading PnL APR…), CSV | Filters (chain, tier, TVL, status, curator, private, empty), search, sorting, CSV export |
 | Havuz detayı / Pool detail | Seviye ve neden kodları, ücret paylaşımı, markout tablosu (4 pencere × 3 ufuk), fiyat sağlayıcı, korumalar (StopLoss, Velocity Guard), canlı derinlik defteri, bin dağılımı, TVL ve hacim geçmişi, X'te paylaş | Tier + reason codes, fee split, markout table, price provider, safeguards, live depth ladder, bin distribution, TVL and volume history, share on X |
 | İşlemler / Trades | Üç zincirde son swap'lar (15 dk / 1 sa / 3 sa), hacim ve istatistik, havuza göre dağılım, otomatik yenileme | Recent swaps on three chains (15 min / 1 h / 3 h), stats, by-pool breakdown, auto-refresh |
-| Cüzdan / Wallet | Adres → üç zincirde açık LP pozisyonları: değer, tutarlar, bin aralığı, aralıkta mı, kazanılan ücret, ücret APR, Trading PnL, döneme göre performans. Ayrıca Ethereum ve Robinhood'da swap geçmişi | Address → open LP positions on three chains: value, amounts, bin range, in-range status, fees earned, fee APR, trading PnL, performance by period. Plus swap history on Ethereum and Robinhood |
+| Cüzdan / Wallet | Adres → üç zincirde açık LP pozisyonları: değer, tutarlar, bin aralığı, aralıkta mı, kazanılan ücret, ücret APR, Trading PnL, döneme göre performans. Ayrıca Ethereum ve Robinhood'da adresin tüm Metric swap'ları ve hacmi | Address → open LP positions on three chains: value, amounts, bin range, in-range status, fees earned, fee APR, trading PnL, performance by period. Plus every Metric swap and its volume on Ethereum and Robinhood |
 | Rehber / Guide | Metric nedir, LP nasıl kazanır, puan için 3 yol, seviyeler, kontrol listesi | What Metric is, how LPs earn, three ways to position for points, tiers, checklist |
 
 ## Nasıl çalışır / How it works
@@ -30,8 +30,8 @@ Bağımlılık yok; tek sayfa statik site (HTML/CSS/JS). Dört veri kaynağı va
    / Current values of funded pools, depth, bin analytics, wallet positions and, as a fallback, pool activity. If it is unreachable the badge reads "Snapshot".
 3. **Zincir RPC'leri / Chain RPCs.** İşlem akışı `Swap` olaylarını doğrudan zincirden okur. Uç noktalar ve ölçülen sınırları `assets/data.js` içinde: Ethereum → MEV Blocker, PublicNode; BNB Chain → PublicNode (istek başına 10 adres); Robinhood Chain → resmî RPC. Hiçbiri yanıt vermezse en aktif havuzlar Metric API'sinden gösterilir.
    / The trade feed reads `Swap` events from the chain. Endpoints and their measured limits live in `assets/data.js`. If none answers, the busiest pools are shown from Metric's API.
-4. **Blok explorer'ları / Block explorers** (Blockscout: Ethereum, Robinhood Chain). Yalnızca cüzdanın swap geçmişi için. Anahtarsız kullanımda ziyaretçi başına saatte yaklaşık 10 sorgu sınırı var; BNB Chain için eşdeğer bir açık kaynak yok.
-   / Only for a wallet's swap history. Keyless use is limited to about 10 requests per hour per visitor; BNB Chain has no equivalent public source.
+4. **Blok explorer'ları / Block explorers** (Blockscout: Ethereum, Robinhood Chain). Yalnızca cüzdanın swap geçmişi için: adresin gönderdiği işlemlerin listesi explorer'dan alınır, her işlemin `Swap` olayları zincirden okunur. Havuzun `Swap` olayı cüzdanı değil router'ı gösterdiği için olay araması tek başına yetmez. BNB Chain için anahtarsız bir işlem listesi kaynağı yok.
+   / Only for a wallet's swap history: the list of transactions the address sent comes from the explorer, and each transaction's `Swap` events are read from the chain. A pool's `Swap` event names the router, not the wallet, so searching events alone is not enough. BNB Chain has no keyless source for an address's transactions.
 
 ## Yayınlama / Deploy (GitHub Pages)
 

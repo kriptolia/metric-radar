@@ -14,10 +14,13 @@
     chains: {
       // logRpc: JSON-RPC endpoints that allow browser calls and serve eth_getLogs, with the largest address list and
       //         block span each accepts per request.
-      // logsApi: Etherscan-compatible log API of an indexed explorer (Blockscout). It answers topic-only queries over
-      //         the whole chain history, but allows about 10 requests per hour per visitor: used for wallet swaps only.
+      // explorerApi: REST API of an indexed explorer (Blockscout v2). Lists the transactions an address sent; allows
+      //         about 150 requests a minute per visitor. Used for a wallet's swap history.
+      // logsApi: the same explorer's Etherscan-compatible log API. Topic-only queries, but about 10 requests per hour
+      //         per visitor, and on Robinhood Chain it only reaches back about a week: a supplement, never the source.
       1: {
         name: "Ethereum", short: "ETH", blockTime: 12, explorer: "https://etherscan.io",
+        explorerApi: "https://eth.blockscout.com/api/v2",
         logsApi: "https://eth.blockscout.com/api",
         logRpc: [
           { url: "https://rpc.mevblocker.io", maxAddrs: 40, maxRange: 5000 },
@@ -26,11 +29,13 @@
       },
       56: {
         name: "BNB Chain", short: "BNB", blockTime: 0.45, explorer: "https://bscscan.com",
+        explorerApi: null, // no keyless indexed explorer for BNB Chain
         logsApi: null,
         logRpc: [{ url: "https://bsc-rpc.publicnode.com", maxAddrs: 10, maxRange: 5000 }],
       },
       4663: {
         name: "Robinhood Chain", short: "Robinhood", blockTime: 0.1, explorer: "https://robin.etherscan.io",
+        explorerApi: "https://robinhoodchain.blockscout.com/api/v2",
         logsApi: "https://robinhoodchain.blockscout.com/api",
         logRpc: [{ url: "https://rpc.mainnet.chain.robinhood.com", maxAddrs: 100, maxRange: 100000 }],
       },
@@ -73,6 +78,7 @@
     if (mock) {
       c.logRpc = [{ url: location.origin + "/rpc/" + id, maxAddrs: 4, maxRange: 20000 }];
       c.logsApi = c.logsApi ? location.origin + "/explorer/" + id + "/api" : null;
+      c.explorerApi = c.explorerApi ? location.origin + "/explorer/" + id + "/api/v2" : null;
     } else {
       // v1 saved its whole default list here; those entries either refuse browsers or do not serve logs
       const dead = /rpc\.metric\.xyz|llamarpc\.com|bsc-dataseed/;
@@ -703,23 +709,105 @@
     return out.sort((a, b) => (b.value || 0) - (a.value || 0));
   };
   /**
-   * Swaps delivered to a wallet on one chain, from the chain's indexed explorer.
-   * Returns { chainId, supported, swaps (newest first), complete, unknownPools }.
+   * Transactions an address sent, newest first, from the explorer's REST API (50 a page), back to `sinceTs`.
+   * Returns { txs, complete }; complete is false when the page budget ran out first.
    */
-  MR.walletSwaps = async function walletSwaps(chainId, wallet, findPool, fromBlock) {
-    if (!CONFIG.chains[chainId].logsApi) return { chainId, supported: false, swaps: [], complete: true, unknownPools: 0 };
-    const r = await explorerLogs(chainId, { fromBlock: fromBlock || 0, topic0: CONFIG.swapTopic, topic2: padAddress(wallet) }, { maxPages: 2 });
-    const swaps = [];
-    let unknownPools = 0;
-    for (const l of r.logs) {
-      const pool = findPool(chainId, l.address);
-      if (!pool) {
-        unknownPools++; // the same event signature from a contract that is not a known Metric pool
-        continue;
+  async function walletTransactions(chainId, wallet, sinceTs, maxPages) {
+    const base = CONFIG.chains[chainId].explorerApi;
+    const txs = [];
+    let params = { filter: "from" };
+    for (let page = 0; page < maxPages; page++) {
+      let r;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          r = await fetchJson(base + "/addresses/" + wallet + "/transactions?" + new URLSearchParams(params).toString(), {}, 30000);
+          break;
+        } catch (e) {
+          if (e.status === 404) return { txs, complete: true }; // an address the explorer has never seen
+          if (e.status === 429) e.rateLimited = true;
+          if (e.rateLimited || attempt >= 1) throw e;
+          await sleep(900); // the explorer answers 500 now and then; the same request succeeds a moment later
+        }
       }
-      const s = decodeSwapLog(l);
-      if (s) swaps.push(describeSwap(s, pool));
+      for (const x of r.items || []) {
+        const ts = Date.parse(x.timestamp) / 1000;
+        if (isFinite(ts) && ts < sinceTs) return { txs, complete: true }; // older than Metric on this chain
+        txs.push(x);
+      }
+      if (!r.next_page_params) return { txs, complete: true };
+      params = { filter: "from" };
+      for (const k of Object.keys(r.next_page_params)) if (r.next_page_params[k] != null) params[k] = String(r.next_page_params[k]);
     }
-    return { chainId, supported: true, swaps: swaps.sort(bySwapOrder), complete: r.complete, unknownPools };
+    return { txs, complete: false };
+  }
+  async function receipt(chainId, hash) {
+    let lastErr = null;
+    for (const ep of CONFIG.chains[chainId].logRpc) {
+      try {
+        const rc = await rpcCall(ep.url, "eth_getTransactionReceipt", [hash], 20000);
+        if (rc) return rc;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (lastErr) throw lastErr;
+    return null;
+  }
+  const WALLET_TX_PAGES = 8; // 400 transactions since Metric's launch on the chain
+  /**
+   * Metric swaps made by a wallet on one chain.
+   * since: { ts, block } of the chain's first Metric pool; nothing older can be a Metric swap.
+   *
+   * The pool's Swap event names the contract that called it and the address the output went to. Wallets trade through
+   * routers, so the output often goes to the router first (always when it is unwrapped to the native coin) and the
+   * event never mentions the wallet. So the source of truth is the wallet's own transactions: every Swap event of a
+   * known pool inside a transaction the wallet sent is that wallet's swap.
+   *
+   * Returns { chainId, supported, swaps (newest first), complete, scanned }.
+   */
+  MR.walletSwaps = async function walletSwaps(chainId, wallet, findPool, since) {
+    const cfg = CONFIG.chains[chainId];
+    if (!cfg.explorerApi) return { chainId, supported: false, swaps: [], complete: true, scanned: 0 };
+    const from = since || { ts: 0, block: 0 };
+    const list = await walletTransactions(chainId, wallet, from.ts || 0, WALLET_TX_PAGES);
+    // A swap always moves tokens, a failed transaction emits no events, and a plain token send cannot contain a swap:
+    // only the remaining receipts are worth reading.
+    const candidates = list.txs.filter((x) => x.status === "ok" && x.method !== "transfer" && (x.transaction_types || x.tx_types || []).includes("token_transfer"));
+    const found = new Map();
+    const add = (log, pool, ts) => {
+      const s = decodeSwapLog(log);
+      if (!s) return;
+      if (ts != null && isFinite(ts)) s.ts = ts;
+      const k = s.tx + ":" + s.logIndex;
+      if (!found.has(k)) found.set(k, describeSwap(s, pool));
+    };
+    let unread = 0;
+    await mapLimit(candidates, 10, async (x) => {
+      let rc;
+      try {
+        rc = await receipt(chainId, x.hash);
+      } catch (e) {
+        unread++;
+        return;
+      }
+      for (const l of (rc && rc.logs) || []) {
+        const pool = findPool(chainId, l.address);
+        if (pool) add(l, pool, Date.parse(x.timestamp) / 1000);
+      }
+    });
+    // Supplement: swaps delivered to the address by somebody else's transaction (smart accounts, relayers).
+    // The log API is tightly rationed, so a refusal here is not an error.
+    if (cfg.logsApi) {
+      try {
+        const r = await explorerLogs(chainId, { fromBlock: from.block || 0, topic0: CONFIG.swapTopic, topic2: padAddress(wallet) }, { maxPages: 1 });
+        for (const l of r.logs) {
+          const pool = findPool(chainId, l.address);
+          if (pool) add(l, pool, null);
+        }
+      } catch (e) {
+        /* supplement only */
+      }
+    }
+    return { chainId, supported: true, swaps: [...found.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0) || bySwapOrder(a, b)), complete: list.complete && !unread, scanned: list.txs.length };
   };
 })();

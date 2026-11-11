@@ -11,8 +11,10 @@ Mock endpoints, with the response shapes of the real services:
   /public/v1/evm/{chain}/{pool}/analytics/bins
   /public/v1/evm/{chain}/{pool}/activity          a pool's latest swaps
   /public/v1/evm/{chain}/positions/{wallet}       open LP positions with performance (demo wallet only)
-  /rpc/{chain}                                    JSON-RPC: eth_getBlockByNumber, eth_getLogs (rejects more than 4 addresses or 20,000 blocks)
-  /explorer/{chain}/api?module=logs&action=getLogs  Etherscan-style logs (swaps delivered to the demo wallet)
+  /rpc/{chain}                                    JSON-RPC: eth_getBlockByNumber, eth_getTransactionReceipt, eth_getLogs
+                                                  (logs: rejects more than 4 addresses or 20,000 blocks)
+  /explorer/{chain}/api/v2/addresses/{a}/transactions   the transactions an address sent, 50 a page (demo wallet only)
+  /explorer/{chain}/api?module=logs&action=getLogs  Etherscan-style logs (swaps whose output went straight to the demo wallet)
   /data/latest.json, /data/history.json           the hourly snapshot, built with scripts/snapshot.py from the mock pools
 
 Query switches for failure drills: ?api=mock&down=rpc | explorer | api | positions (comma-separated), read from the Referer.
@@ -190,14 +192,42 @@ def swap_log(p: dict, s: dict, style: str) -> dict:
 
 
 def wallet_swaps(cid: int) -> list[tuple[dict, dict]]:
-    """Fourteen swaps delivered to the demo wallet on this chain's first pools, all after those pools were created."""
+    """Fourteen swaps the demo wallet made on this chain's first pools, all after those pools were created.
+
+    As in production, the output of every other swap goes to the router first (it unwraps to the native coin), so the
+    pool's event does not mention the wallet at all: only the wallet's own transactions reveal those.
+    """
     cpools = [p for p in POOLS if p["_chainId"] == cid and stride_of(p)]
-    latest = latest_block(cid)
+    base = CHAINS[cid][2]
     out = []
     for k in range(14):
         p = cpools[k % len(cpools)]
-        out.append((p, swap_at(p, latest - (k + 1) * 1200, DEMO_WALLET)))
+        out.append((p, swap_at(p, base - (k + 1) * 1200, DEMO_WALLET if k % 2 == 0 else ROUTER)))
     return out
+
+
+def iso(ts: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime(ts))
+
+
+def wallet_transactions(cid: int) -> list[dict]:
+    """What the explorer lists for the demo wallet, newest first: its swaps, unrelated activity, and older history."""
+    base = CHAINS[cid][2]
+    txs = []
+    for p, s in wallet_swaps(cid):
+        txs.append({"hash": s["tx"], "block_number": s["block"], "status": "ok", "result": "success", "method": "0xac9650d8", "transaction_types": ["contract_call", "token_transfer"]})
+    for k in range(45):  # approvals, transfers and one failed swap between them: none of these holds a Metric swap
+        kind = k % 3
+        txs.append({"hash": "0x" + hashlib.sha256(f"misc{cid}{k}".encode()).hexdigest(), "block_number": base - 600 - k * 380,
+                    "status": "error" if k == 7 else "ok", "result": "execution reverted" if k == 7 else "success",
+                    "method": ["approve", None, "transfer"][kind], "transaction_types": [["contract_call"], ["coin_transfer"], ["contract_call", "token_transfer"]][kind]})
+    for k in range(70):  # activity from before Metric existed on the chain
+        txs.append({"hash": "0x" + hashlib.sha256(f"old{cid}{k}".encode()).hexdigest(), "block_number": base - int((95 + k) * 86400 / CHAINS[cid][1]),
+                    "status": "ok", "result": "success", "method": "swap", "transaction_types": ["contract_call", "token_transfer"]})
+    txs.sort(key=lambda x: -x["block_number"])
+    for x in txs:
+        x.update({"timestamp": iso(block_ts(cid, x["block_number"])), "from": {"hash": DEMO_WALLET, "is_contract": False}, "to": {"hash": ROUTER, "is_contract": True, "name": None}, "token_transfers": None, "token_transfers_overflow": None})
+    return txs
 
 
 def handle_rpc(cid: int, req: dict):
@@ -209,6 +239,14 @@ def handle_rpc(cid: int, req: dict):
     if method == "eth_getBlockByNumber":
         n = latest if params[0] == "latest" else min(latest, int(params[0], 16))
         return {"number": hex(n), "timestamp": hex(block_ts(cid, n)), "hash": "0x" + "00" * 32}
+    if method == "eth_getTransactionReceipt":
+        for p, sw in wallet_swaps(cid):
+            if sw["tx"] == params[0]:
+                # a token transfer first, then the pool's event: readers must pick the Swap out of the receipt
+                transfer = {"address": p["token0"].lower(), "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", topic_addr(DEMO_WALLET), topic_addr(p["poolAddress"])], "data": "0x" + word(1), "blockNumber": hex(sw["block"]), "transactionHash": sw["tx"], "logIndex": "0x0"}
+                return {"transactionHash": sw["tx"], "blockNumber": hex(sw["block"]), "status": "0x1", "from": DEMO_WALLET, "to": ROUTER.lower(), "logs": [transfer, swap_log(p, sw, "rpc")]}
+        known = {x["hash"] for x in wallet_transactions(cid)}
+        return {"transactionHash": params[0], "status": "0x1", "logs": []} if params[0] in known else None
     if method == "eth_getLogs":
         f = params[0]
         frm = int(f.get("fromBlock", "0x0"), 16)
@@ -353,6 +391,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(SNAPSHOT_LATEST if parts[1] == "latest.json" else SNAPSHOT_HISTORY)
         if len(parts) == 3 and parts[0] == "explorer" and parts[2] == "api":
             return self.explorer(int(parts[1]), q)
+        if len(parts) == 7 and parts[0] == "explorer" and parts[2:5] == ["api", "v2", "addresses"] and parts[6] == "transactions":
+            return self.explorer_transactions(int(parts[1]), parts[5], q)
         if parts[:2] == ["public", "v1"]:
             if "api" in self.down():
                 return self.send_json({"error": "upstream unavailable"}, 503)
@@ -368,11 +408,22 @@ class Handler(SimpleHTTPRequestHandler):
         to = int(q.get("toBlock", ["999999999"])[0])
         logs = []
         if q.get("topic0") == [TOPIC_SWAP] and q.get("topic2") == [topic_addr(DEMO_WALLET)]:
-            logs = [swap_log(p, s, "explorer") for p, s in wallet_swaps(cid) if frm <= s["block"] <= to]
+            logs = [swap_log(p, s, "explorer") for p, s in wallet_swaps(cid) if frm <= s["block"] <= to and s["recipient"] == DEMO_WALLET]
             logs.sort(key=lambda l: int(l["blockNumber"], 16))
         if not logs:
             return self.send_json({"message": "No logs found", "result": [], "status": "0"})
         return self.send_json({"message": "OK", "result": logs[:1000], "status": "1"})
+
+    def explorer_transactions(self, cid: int, address: str, q: dict):
+        """Blockscout's REST listing: 50 a page, newest first, continued with the block number of the last item."""
+        if "explorer" in self.down():
+            return self.send_json({"message": "Too Many Requests"}, 429)
+        txs = wallet_transactions(cid) if address.lower() == DEMO_WALLET else []
+        if "block_number" in q:
+            txs = [x for x in txs if x["block_number"] < int(q["block_number"][0])]
+        page = txs[:50]
+        nxt = {"block_number": page[-1]["block_number"], "index": 0, "items_count": 50, "filter": "from"} if len(txs) > 50 else None
+        return self.send_json({"items": page, "next_page_params": nxt})
 
     def api(self, rest: list[str], q: dict):
         if rest == ["chains"]:

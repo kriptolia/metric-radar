@@ -963,12 +963,18 @@
       W.results = null;
       run();
     }
-    /** The explorer scans forward from here: the block of the chain's first Metric pool. */
-    function firstPoolBlock(chainId) {
-      const blocks = pools().concat(emptyPools()).filter((p) => p.chainId === chainId && p.createdBlock > 0).map((p) => p.createdBlock);
-      return blocks.length ? Math.min(...blocks) : 0;
+    /** When and at which block the chain's first Metric pool was created: no swap can be older. */
+    function firstPool(chainId) {
+      let ts = Infinity;
+      let block = Infinity;
+      for (const p of pools().concat(emptyPools())) {
+        if (p.chainId !== chainId) continue;
+        if (p.created > 0 && p.created < ts) ts = p.created;
+        if (p.createdBlock > 0 && p.createdBlock < block) block = p.createdBlock;
+      }
+      return { ts: isFinite(ts) ? ts - 3600 : 0, block: isFinite(block) ? block : 0 };
     }
-    /** Positions (Metric API) and swap history (explorers) of one address. Never rejects: failures are listed in the result. */
+    /** Positions (Metric API) and swap history (explorer + chain) of one address. Never rejects: failures are listed in the result. */
     function lookup(addr) {
       if (W.pending && W.pending.addr === addr) return W.pending.promise; // a redraw joins the lookup already in flight
       const promise = (async () => {
@@ -981,7 +987,7 @@
           }
         }).concat(CHAIN_IDS.map(async (id) => {
           try {
-            const r = await MR.walletSwaps(id, addr, findPool, firstPoolBlock(id));
+            const r = await MR.walletSwaps(id, addr, findPool, firstPool(id));
             if (!r.supported) res.swapNotes.push({ id, kind: "unsupported" });
             else {
               res.swaps.push(...r.swaps);

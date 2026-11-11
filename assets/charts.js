@@ -60,7 +60,10 @@
    */
   MR.lineChart = function lineChart(container, opts) {
     container.innerHTML = "";
-    const series = (opts.series || []).filter((s) => s.points && s.points.length);
+    // a line needs two points: a series with fewer is left out, and with none left the chart says why it is empty
+    const series = (opts.series || [])
+      .map((s) => ({ ...s, points: (s.points || []).filter((p) => p[1] != null && isFinite(p[1])) }))
+      .filter((s) => s.points.length >= 2);
     if (!series.length) {
       container.appendChild(html("p", "mr-empty", opts.emptyText || "—"));
       return;
@@ -98,7 +101,7 @@
     svg.appendChild(el("line", { x1: pad.l, x2: W - pad.r, y1: sy(yMin), y2: sy(yMin), class: "mr-baseline" }));
     // series
     series.forEach((s) => {
-      const pts = s.points.filter((p) => p[1] != null && isFinite(p[1]));
+      const pts = s.points;
       const d = pts.map((p, i) => (i ? "L" : "M") + sx(p[0]).toFixed(1) + " " + sy(p[1]).toFixed(1)).join(" ");
       if (opts.area && series.length === 1) {
         const dA = d + ` L${sx(pts[pts.length - 1][0]).toFixed(1)} ${sy(yMin)} L${sx(pts[0][0]).toFixed(1)} ${sy(yMin)} Z`;
@@ -271,7 +274,11 @@
     container.innerHTML = "";
     const W = Math.max(320, container.clientWidth || 640);
     const rowH = 34;
-    const pad = { l: 118, r: 14, t: 6, b: 22 };
+    const narrow = W < 480;
+    const pad = { l: narrow ? 110 : 118, r: 14, t: 6, b: 22 };
+    // a crowded strip turns into a solid band: shrink and lighten the dots as their density per pixel grows
+    const density = Math.max(0, ...rows.map((r) => r.dots.length)) / Math.max(1, W - pad.l - pad.r);
+    const shrink = density > 0.6 ? 0.42 : density > 0.3 ? 0.58 : density > 0.15 ? 0.78 : 1;
     const H = pad.t + rows.length * rowH + pad.b;
     const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", height: H, class: "mr-chart mr-pulse" });
     const clipId = "pulse-clip-" + Math.random().toString(36).slice(2, 8);
@@ -286,8 +293,8 @@
       lbl.textContent = r.label;
       svg.appendChild(lbl);
       r.dots.forEach((d) => {
-        const rad = 2.5 + 9 * Math.sqrt((d.usd || 0) / maxUsd);
-        const c = el("circle", { cx: sx(d.t), cy: y, r: rad.toFixed(1), fill: r.color, "fill-opacity": 0.55, stroke: r.color, "stroke-width": 1 });
+        const rad = Math.max(1.3, (2.5 + 9 * Math.sqrt((d.usd || 0) / maxUsd)) * shrink);
+        const c = el("circle", { cx: sx(d.t), cy: y, r: rad.toFixed(1), fill: r.color, "fill-opacity": shrink < 1 ? 0.4 : 0.55, stroke: r.color, "stroke-width": shrink < 1 ? 0.6 : 1 });
         c.addEventListener("mousemove", (ev) => showTip(ev.clientX, ev.clientY, d.title || ""));
         c.addEventListener("mouseleave", hideTip);
         if (d.href) {
@@ -298,10 +305,11 @@
       });
     });
     svg.appendChild(plot);
-    // time axis: 5 ticks
-    for (let k = 0; k <= 4; k++) {
-      const t = from + ((to - from) * k) / 4;
-      const lbl = el("text", { x: sx(t), y: H - 6, class: "mr-axis", "text-anchor": k === 0 ? "start" : k === 4 ? "end" : "middle" });
+    // time axis: five ticks, three where there is no room for more
+    const steps = narrow ? 2 : 4;
+    for (let k = 0; k <= steps; k++) {
+      const t = from + ((to - from) * k) / steps;
+      const lbl = el("text", { x: sx(t), y: H - 6, class: "mr-axis", "text-anchor": k === 0 ? "start" : k === steps ? "end" : "middle" });
       lbl.textContent = opts && opts.xFmt ? opts.xFmt(t) : "";
       svg.appendChild(lbl);
     }

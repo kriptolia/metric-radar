@@ -13,54 +13,60 @@ Bağımsız bir topluluk projesidir; Metric ile bağlantısı yoktur. Yatırım 
 
 | Sekme / Tab | TR | EN |
 |---|---|---|
-| Genel bakış / Overview | Zincir bazında TVL, hacim (24s/7g/tüm zamanlar), havuz sayısı, güvenlik dağılımı, öne çıkan havuzlar, son 1 saatin "işlem nabzı", TVL/hacim geçmişi | Per-chain TVL, volume (24h/7d/all), pool counts, safety mix, leading pools, last-hour "trade pulse", TVL/volume history |
-| Havuzlar / Pools | Filtre (zincir, seviye, TVL, durum, küratör, özel), arama, sıralama (TVL, hacim, 7g APR, Markout APR, Trading PnL APR…), CSV | Filters (chain, tier, TVL, status, curator, private), search, sorting (TVL, volume, 7d APR, markout APR, trading PnL APR…), CSV export |
-| Havuz detayı / Pool detail | Seviye ve neden kodları (açıklamalı), ücret paylaşımı, markout tablosu (4 pencere × 3 ufuk), fiyat sağlayıcı, korumalar (StopLoss, Velocity Guard), canlı derinlik defteri, bin dağılımı, havuz geçmişi, X'te paylaş | Tier + reason codes explained, fee split, markout table (4 windows × 3 horizons), price provider, safeguards, live depth ladder, bin distribution, pool history, share on X |
-| İşlemler / Trades | Zincir RPC'sinden okunan son swap'lar (1s–24s), hacim/istatistik, havuza göre dağılım, otomatik yenileme | Recent swaps read from chain RPCs (1h–24h), stats, by-pool breakdown, auto-refresh |
-| Cüzdan / Wallet | Adres → üç zincirde LP pozisyonları (değer, tutarlar, bin aralığı, aralıkta mı), swap geçmişi ve hacmi, puan paneli (uç nokta açılınca dolacak) | Address → LP positions on three chains (value, amounts, bin range, in-range status), swap history and volume, points panel (fills once the endpoint opens) |
+| Genel bakış / Overview | Zincir bazında TVL, hacim, fonlu havuz sayısı, güvenlik dağılımı, öne çıkan havuzlar, son 15 dakikanın "işlem nabzı", TVL/hacim geçmişi | Per-chain TVL, volume, funded-pool counts, safety mix, leading pools, a 15-minute "trade pulse", TVL/volume history |
+| Havuzlar / Pools | Filtre (zincir, seviye, TVL, durum, küratör, özel, boş), arama, sıralama (TVL, hacim, 7g APR, Markout APR, Trading PnL APR…), CSV | Filters (chain, tier, TVL, status, curator, private, empty), search, sorting, CSV export |
+| Havuz detayı / Pool detail | Seviye ve neden kodları, ücret paylaşımı, markout tablosu (4 pencere × 3 ufuk), fiyat sağlayıcı, korumalar (StopLoss, Velocity Guard), canlı derinlik defteri, bin dağılımı, TVL ve hacim geçmişi, X'te paylaş | Tier + reason codes, fee split, markout table, price provider, safeguards, live depth ladder, bin distribution, TVL and volume history, share on X |
+| İşlemler / Trades | Üç zincirde son swap'lar (15 dk / 1 sa / 3 sa), hacim ve istatistik, havuza göre dağılım, otomatik yenileme | Recent swaps on three chains (15 min / 1 h / 3 h), stats, by-pool breakdown, auto-refresh |
+| Cüzdan / Wallet | Adres → üç zincirde açık LP pozisyonları: değer, tutarlar, bin aralığı, aralıkta mı, kazanılan ücret, ücret APR, Trading PnL, döneme göre performans. Ayrıca Ethereum ve Robinhood'da swap geçmişi | Address → open LP positions on three chains: value, amounts, bin range, in-range status, fees earned, fee APR, trading PnL, performance by period. Plus swap history on Ethereum and Robinhood |
 | Rehber / Guide | Metric nedir, LP nasıl kazanır, puan için 3 yol, seviyeler, kontrol listesi | What Metric is, how LPs earn, three ways to position for points, tiers, checklist |
 
 ## Nasıl çalışır / How it works
 
-- **Veri / Data:** Metric'in anahtarsız açık API'si (`api.metric.xyz/public/v1`). Tarayıcı canlı API'ye ulaşamazsa (CORS vb.) site `data/latest.json` anlık görüntüsüne düşer ve rozet "Anlık görüntü" olur.
-  / Metric's keyless public API. If the browser can't reach it (CORS etc.), the site falls back to the `data/latest.json` snapshot and the badge reads "Snapshot".
-- **Zincir verisi / Chain data:** İşlem akışı ve cüzdan sorgusu doğrudan JSON-RPC ile çalışır (`rpc.metric.xyz/{chainId}`, ardından public RPC'ler). `LiquidityAdded/Removed` ve `Swap` olayları okunur; pozisyonlar `MetricOmmPoolDataProvider` üzerinden (`positionBinShares`, `binTotalShares`, `binState`) Multicall3 ile değerlenir.
-  / The trade feed and wallet lookup use JSON-RPC directly. `LiquidityAdded/Removed` and `Swap` logs are decoded; positions are valued through `MetricOmmPoolDataProvider` via Multicall3.
-- **Geçmiş / History:** `scripts/snapshot.py` GitHub Actions ile saatte bir çalışır, `data/latest.json` ve `data/history.json` dosyalarını günceller (zincir bazında saatlik + günlük, havuz bazında günlük seri).
-  / `scripts/snapshot.py` runs hourly on GitHub Actions and rolls `data/latest.json` and `data/history.json`.
-- Bağımlılık yok; tek sayfa statik site (HTML/CSS/JS). / No dependencies; a single-page static site.
+Bağımlılık yok; tek sayfa statik site (HTML/CSS/JS). Dört veri kaynağı var: / No dependencies; a single-page static site with four data sources:
+
+1. **Saatlik anlık görüntü / Hourly snapshot.** `scripts/snapshot.py`, GitHub Actions ile saatte bir Metric'in açık API'sinden tüm havuzları çeker ve `latest.json` + `history.json` dosyalarını bu repo'nun `data` dalına yazar (dal her seferinde tek commit olarak yenilenir; repo büyümez, `main` yalnızca kod içerir). Sayfa önce bunu çizer.
+   / Hourly, `scripts/snapshot.py` pulls every pool from Metric's public API and publishes `latest.json` + `history.json` to this repo's `data` branch (one commit, replaced each run: the repo doesn't grow and `main` stays code-only). The page paints from it first.
+2. **Metric açık API'si / Metric public API** (`api.metric.xyz/public/v1`, anahtarsız / keyless). Fonlu havuzların güncel değerleri, derinlik, bin analizi, cüzdan pozisyonları (`/evm/{chain}/positions/{adres}`) ve yedek olarak havuz aktivitesi. API'ye ulaşılamazsa rozet "Anlık görüntü" olur.
+   / Current values of funded pools, depth, bin analytics, wallet positions and, as a fallback, pool activity. If it is unreachable the badge reads "Snapshot".
+3. **Zincir RPC'leri / Chain RPCs.** İşlem akışı `Swap` olaylarını doğrudan zincirden okur. Uç noktalar ve ölçülen sınırları `assets/data.js` içinde: Ethereum → MEV Blocker, PublicNode; BNB Chain → PublicNode (istek başına 10 adres); Robinhood Chain → resmî RPC. Hiçbiri yanıt vermezse en aktif havuzlar Metric API'sinden gösterilir.
+   / The trade feed reads `Swap` events from the chain. Endpoints and their measured limits live in `assets/data.js`. If none answers, the busiest pools are shown from Metric's API.
+4. **Blok explorer'ları / Block explorers** (Blockscout: Ethereum, Robinhood Chain). Yalnızca cüzdanın swap geçmişi için. Anahtarsız kullanımda ziyaretçi başına saatte yaklaşık 10 sorgu sınırı var; BNB Chain için eşdeğer bir açık kaynak yok.
+   / Only for a wallet's swap history. Keyless use is limited to about 10 requests per hour per visitor; BNB Chain has no equivalent public source.
 
 ## Yayınlama / Deploy (GitHub Pages)
 
-1. Repo'yu `kriptolia/metric-radar` olarak oluştur ve bu klasörü `main` dalına push et.
+1. Repo'yu `main` dalına push et. / Push the repo to `main`.
 2. **Settings → Pages → Source: Deploy from a branch → `main` / `/ (root)`**.
-3. **Settings → Actions → General → Workflow permissions: Read and write** (saatlik anlık görüntü commit'i için).
-4. **Actions → snapshot → Run workflow** ile ilk anlık görüntüyü al. Sonrası saat başı otomatik.
+3. `snapshot` iş akışı push ile kendiliğinden çalışır ve `data` dalını oluşturur; sonrası saat başı otomatik. Elle çalıştırmak için: **Actions → snapshot → Run workflow**. Ek izin ya da gizli anahtar gerekmez.
+   / The `snapshot` workflow runs on push and creates the `data` branch; after that it runs hourly. No extra permissions or secrets.
 
-EN: create the repo, push to `main`, enable Pages from the `main` branch root, give Actions read/write permission, run the `snapshot` workflow once.
+Fork'larda sayfa kendi `data` dalını okur (`<kullanıcı>.github.io/<repo>` adresinden türetilir). GitHub, 60 gün hareketsiz kalan herkese açık repo'larda zamanlanmış iş akışlarını durdurur; durursa Actions sekmesinden yeniden etkinleştir.
+/ Forks read their own `data` branch. GitHub pauses scheduled workflows in public repos after 60 days without activity; re-enable it from the Actions tab if that happens.
 
 ## Ayarlar / Settings
 
-- Sağ üstteki dişli: API adresi ve zincir başına RPC listesi (tarayıcıda saklanır). / The gear icon: API base and per-chain RPC lists (stored in the browser).
-- CORS hatası alırsan `proxy/worker.js` dosyasını bir Cloudflare Worker olarak yayınla ve API adresi olarak onu gir. / If you hit a CORS error, deploy `proxy/worker.js` as a Cloudflare Worker and point the API base at it.
-- Referans kodu: `assets/data.js` içinde `referralCode` alanı; dolu olursa havuz bağlantıları `?ref=` ile açılır. / Referral code: `referralCode` in `assets/data.js`; when set, pool links carry `?ref=`.
+- Sağ üstteki dişli: API adresi ve işlem akışı için ek RPC adresleri (tarayıcıda saklanır). / The gear icon: API base and extra RPC endpoints for the trade feed (stored in the browser).
+- Metric API'sine kendi proxy'n üzerinden gitmek istersen `proxy/worker.js` dosyasını bir Cloudflare Worker olarak yayınla ve API adresi olarak onu gir. / To reach Metric's API through your own proxy, deploy `proxy/worker.js` as a Cloudflare Worker and enter it as the API base.
+- Referans kodu: `assets/data.js` içinde `referralCode`; dolu olursa havuz bağlantıları `?ref=` ile açılır. / Referral code: `referralCode` in `assets/data.js`; when set, pool links carry `?ref=`.
 - Dil: tarayıcı diline göre otomatik; `?lang=tr` / `?lang=en` ile zorlanır. / Language follows the browser; force with `?lang=`.
+- Yeni sürüm yayınlarken `index.html` içindeki `?v=` değerini artır. / Bump the `?v=` value in `index.html` with each release.
 
 ## Geliştirme / Development
 
 ```bash
-python3 scripts/dev_mock.py 8080        # mock API + mock RPC + static site
-open "http://localhost:8080/?api=mock"   # demo wallet: 0x1111111111111111111111111111111111111111
-METRIC_API_BASE=http://localhost:8080/public/v1 python3 scripts/snapshot.py   # snapshot against the mock
+python3 scripts/dev_mock.py 8080         # mock API + mock RPC + mock explorer + static site
+open "http://localhost:8080/?api=mock"    # demo wallet: 0x1111111111111111111111111111111111111111
+open "http://localhost:8080/?api=mock&down=rpc"   # failure drills: rpc, explorer, api, positions
+METRIC_API_BASE=http://localhost:8080/public/v1 python3 scripts/snapshot.py   # snapshot against the mock → data/
 ```
 
-Gerçek API ile: `python3 -m http.server 8080` ve `http://localhost:8080/`. / With the real API: any static server.
+Gerçek servislerle: `python3 -m http.server 8080` ve `http://localhost:8080/`. `?data=local`, anlık görüntüyü `data/` klasöründen okur. / With the real services: any static server. `?data=local` reads the snapshot from `data/`.
 
 ## Teşekkür / Credits
 
 - Metric ekibi ve [dokümantasyonu](https://docs.metric.xyz) / the Metric team and docs
 - [@0xMoei](https://x.com/0xMoei) — [metricscan](https://metricscan.org) ilhamı / inspiration
-- [filipelclima/metric-lp-planner](https://github.com/filipelclima/metric-lp-planner) — pozisyon okuma yöntemi / position-reading method
+- [filipelclima/metric-lp-planner](https://github.com/filipelclima/metric-lp-planner) — havuz olaylarını okuma yöntemi / method for reading pool events
 
 ## Lisans / License
 

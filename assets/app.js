@@ -6,19 +6,24 @@
   const CONFIG = MR.config;
   const CHAIN_IDS = Object.keys(CONFIG.chains).map(Number);
   const SERIES = { 1: "var(--series-1)", 56: "var(--series-2)", 4663: "var(--series-3)" };
-  const TIER_ORDER = ["green", "yellow", "red", "unclassified", "black"];
+  const FUNDED_MIN_TVL = 1; // below this a pool counts as empty (same threshold as scripts/snapshot.py)
+  const PULSE_SECONDS = 900;
+  const TRADE_WINDOWS = { "15m": 900, "1h": 3600, "3h": 10800 };
+  const PERIODS = ["24h", "7d", "30d", "all"];
 
   // ---------- state ----------
   const S = {
     lang: null,
     theme: null,
-    data: null, // { pools, history, status }
-    status: { source: "loading" },
+    data: null, // { pools, index, history, generatedAt, chainMeta, liveAt }
+    status: { source: "loading" }, // source: loading | snapshot | live | error; api: pending | ok | down
     route: null,
-    pulse: null,
-    trades: { window: "1h", results: {}, loading: false, auto: false, timer: null },
-    wallet: { addr: "", results: null, loading: false, errors: [] },
-    poolsView: { chain: "all", tier: new Set(["green", "yellow", "red", "unclassified"]), status: "any", minTvl: 1000, healthy: false, verified: false, hidePrivate: false, q: "", sort: "tvl", dir: "desc" },
+    pulse: null, // { at, promise } shared by re-renders of the overview
+    poolMap: null, // { data, map } lookup of every known pool by chain:address
+    poolFetch: {}, // chain:address -> "loading" | "failed", for pool pages whose full record is fetched on demand
+    trades: { window: "1h", auto: false, timer: null },
+    wallet: { addr: "", results: null, pending: null }, // pending: { addr, promise } of a lookup in flight
+    poolsView: { chain: "all", tier: new Set(["green", "yellow", "red", "unclassified"]), minTvl: 1000, healthy: false, verified: false, hidePrivate: false, showEmpty: false, q: "", sort: "tvl" },
   };
 
   // ---------- i18n ----------
@@ -62,8 +67,9 @@
     if (a >= 1e9) return sign + "$" + (a / 1e9).toFixed(2) + "B";
     if (a >= 1e6) return sign + "$" + (a / 1e6).toFixed(2) + "M";
     if (a >= 1e4) return sign + "$" + (a / 1e3).toFixed(1) + "K";
-    if (a >= 100) return sign + "$" + a.toFixed(0);
-    if (a >= 1) return sign + "$" + a.toFixed(digits != null ? digits : 2);
+    if (a >= 100) return sign + "$" + new Intl.NumberFormat(locale(), { maximumFractionDigits: 0 }).format(a);
+    if (a >= 0.01) return sign + "$" + a.toFixed(digits != null ? digits : 2);
+    if (a === 0) return "$0";
     return sign + "$" + a.toFixed(digits != null ? digits : 4);
   }
   function fmtUsdFull(v) {
@@ -79,12 +85,19 @@
   function fmtBps(bps, signed) {
     if (bps == null || !isFinite(bps)) return t("common.na");
     const p = bps / 100;
-    const s = (signed && p > 0 ? "+" : "") + (Math.abs(p) >= 1000 ? p.toFixed(0) : Math.abs(p) >= 100 ? p.toFixed(1) : p.toFixed(2)) + "%";
-    return s;
+    return (signed && p > 0 ? "+" : "") + (Math.abs(p) >= 1000 ? p.toFixed(0) : Math.abs(p) >= 100 ? p.toFixed(1) : p.toFixed(2)) + "%";
   }
   function fmtPct(frac, d) {
     if (frac == null || !isFinite(frac)) return t("common.na");
     return (frac * 100).toFixed(d != null ? d : 1) + "%";
+  }
+  /** Percent with as many decimals as the size needs: 15%, 2.5%, 0.05%, 0.0012%. */
+  function fmtPctSmart(frac) {
+    if (frac == null || !isFinite(frac)) return t("common.na");
+    const p = frac * 100;
+    const a = Math.abs(p);
+    const d = a >= 10 ? 1 : a >= 0.1 ? 2 : a >= 0.01 ? 3 : 4;
+    return String(Number(p.toFixed(d))) + "%";
   }
   function fmtInt(v) {
     if (v == null || !isFinite(v)) return t("common.na");
@@ -149,6 +162,9 @@
     const d = (Date.now() / 1000 - p.created) / 86400;
     return d < 1 ? t("time.hour", { n: Math.max(1, Math.round(d * 24)) }) : t("time.day", { n: Math.round(d) });
   }
+  function signCls(v) {
+    return v == null ? "" : v < 0 ? "neg" : v > 0 ? "pos" : "";
+  }
 
   // ---------- DOM helpers ----------
   const $ = (sel, root) => (root || document).querySelector(sel);
@@ -191,8 +207,7 @@
   }
   function tierChip(p, withText) {
     const tier = tierOf(p);
-    const c = h("span", { class: "chip tier tier-" + tier, title: t("tiers.desc." + tier) }, h("i", { class: "sw" }), withText === false ? "" : t("tiers." + tier));
-    return c;
+    return h("span", { class: "chip tier tier-" + tier, title: t("tiers.desc." + tier) }, h("i", { class: "sw" }), withText === false ? "" : t("tiers." + tier));
   }
   function statusChip(p) {
     const st = p.pauseLevel && p.pauseLevel > 0 ? "pool_paused" : p.ppStatus || "unknown";
@@ -222,6 +237,12 @@
   function empty(text) {
     return h("p", { class: "mr-empty" }, text);
   }
+  function note(text) {
+    return h("p", { class: "note" }, text);
+  }
+  function kv(rows) {
+    return h("dl", { class: "kv" }, ...rows.map(([k, v]) => h("div", { class: "kv-row" }, h("dt", null, k), h("dd", null, v))));
+  }
 
   // ---------- router ----------
   function parseRoute() {
@@ -245,7 +266,7 @@
     nav.innerHTML = "";
     const r = S.route || parseRoute();
     ["overview", "pools", "trades", "wallet", "guide"].forEach((n) => {
-      const a = h("a", { href: "#/" + n, class: "tab" + ((r.name === n || (n === "pools" && r.name === "pool")) ? " active" : ""), "aria-current": r.name === n ? "page" : null }, t("nav." + n));
+      const a = h("a", { href: "#/" + n, class: "tab" + (r.name === n || (n === "pools" && r.name === "pool") ? " active" : ""), "aria-current": r.name === n ? "page" : null }, t("nav." + n));
       nav.appendChild(a);
     });
     $("#byline").textContent = t("byline");
@@ -265,69 +286,117 @@
     else if (st.source === "snapshot") b.textContent = t("source.snapshot") + (st.generatedAt ? " · " + t("source.snapshotAge", { age: fmtAgo(st.generatedAt).replace(/ (önce|ago)$/, "") }) : "");
     else if (st.source === "error") b.textContent = t("source.error");
     else b.textContent = t("source.loading");
-    b.title = st.error ? st.error : "";
+    b.title = st.error ? t("source.liveFailed") + " " + st.error : "";
   }
 
   // ---------- data helpers ----------
   function pools() {
     return (S.data && S.data.pools) || [];
   }
-  function poolByKey(chainId, addr) {
-    const a = addr.toLowerCase();
-    return pools().find((p) => p.chainId === Number(chainId) && p.address.toLowerCase() === a);
+  function emptyPools() {
+    return (S.data && S.data.index) || [];
   }
-  function histKey(p) {
-    return p.chainId + ":" + p.address.toLowerCase();
+  /** Any known pool (funded or empty) by chain and address. */
+  function findPool(chainId, addr) {
+    if (!S.data || !addr) return null;
+    if (!S.poolMap || S.poolMap.data !== S.data) {
+      const map = new Map();
+      for (const p of emptyPools()) map.set(MR.poolKey(p), p);
+      for (const p of pools()) map.set(MR.poolKey(p), p);
+      S.poolMap = { data: S.data, map };
+    }
+    return S.poolMap.map.get(Number(chainId) + ":" + String(addr).toLowerCase()) || null;
   }
   function sum(arr, f) {
     return arr.reduce((s, x) => s + (f(x) || 0), 0);
   }
+  const isFunded = (p) => (p.tvl || 0) >= FUNDED_MIN_TVL;
+
+  // history series: [[ts, value]]
+  const HIST_IDX = { ts: 0, tvl: 1, vol24: 2, pools: 3, swaps24: 4 };
+  function seriesFor(chainId, field, maxPoints) {
+    const hst = S.data && S.data.history;
+    if (!hst || !hst.hourly || !hst.hourly[chainId]) return [];
+    return hst.hourly[chainId].slice(-(maxPoints || 1000)).map((r) => [r[0], r[HIST_IDX[field]]]);
+  }
+  function dailySeriesFor(chainId, field) {
+    const hst = S.data && S.data.history;
+    if (!hst || !hst.daily || !hst.daily[chainId]) return [];
+    return hst.daily[chainId].map((r) => [r[0], r[HIST_IDX[field]]]);
+  }
+  function poolHistory(p) {
+    const hst = S.data && S.data.history;
+    if (!hst || !hst.pools) return [];
+    return hst.pools[MR.poolKey(p)] || [];
+  }
+
+  // ---------- swap helpers shared by the overview pulse, the trade feed and the wallet ----------
+  function swapTip(s) {
+    return `<div class="mr-tip-head">${esc(s.pair)} · ${fmtTime(s.ts)}</div><div>${s.side === "sell" ? t("trades.sell") : t("trades.buy")} ${esc(fmtNum(s.amountIn))} ${esc(s.tokIn.sym)} → ${esc(fmtNum(s.amountOut))} ${esc(s.tokOut.sym)}</div><b>${fmtUsd(s.usd)}</b>`;
+  }
+  /** Dots for the pulse strip; a busy window keeps its largest swaps so the strip stays readable and light. */
+  function swapDots(swaps, cap) {
+    const list = swaps.length > cap ? [...swaps].sort((a, b) => (b.usd || 0) - (a.usd || 0)).slice(0, cap) : swaps;
+    return list.map((s) => ({ t: s.ts, usd: s.usd || 0, href: explorerTx(s.chainId, s.tx), title: swapTip(s) }));
+  }
+  function sideCell(s) {
+    return h("span", { class: "side " + s.side }, s.side === "sell" ? t("trades.sell") + " " + s.tokIn.sym : t("trades.buy") + " " + s.tokOut.sym);
+  }
+  function pulseData() {
+    if (S.pulse && Date.now() - S.pulse.at < 30000) return S.pulse.promise;
+    const ps = pools().filter((p) => p.tier !== "black");
+    const promise = Promise.all(
+      CHAIN_IDS.map(async (id) => {
+        try {
+          return { id, r: await MR.recentSwaps(id, ps.filter((p) => p.chainId === id), PULSE_SECONDS) };
+        } catch (e) {
+          return { id, r: null };
+        }
+      })
+    );
+    S.pulse = { at: Date.now(), promise };
+    return promise;
+  }
 
   // ---------- views ----------
   function viewOverview(main) {
-    const ps = pools();
-    const live = ps.filter((p) => p.tier !== "black");
+    const live = pools().filter((p) => p.tier !== "black");
+    const funded = live.filter(isFunded);
+    const everyPool = live.concat(emptyPools());
     const tvl = sum(live, (p) => p.tvl);
-    const vol24 = sum(live, (p) => p.vol24);
-    const vol7 = sum(live, (p) => p.vol7);
-    const volAll = sum(live, (p) => p.volAll);
-    const swaps24 = sum(live, (p) => p.swaps24);
-    const fees24 = sum(live, (p) => p.fees24);
-    const healthy = live.filter((p) => p.ppStatus === "healthy" && !(p.pauseLevel > 0)).length;
+    const healthy = funded.filter((p) => p.ppStatus === "healthy" && !(p.pauseLevel > 0)).length;
 
-    const hero = h("section", { class: "hero" },
-      h("div", { class: "hero-text" }, h("h1", null, t("overview.title")), h("p", { class: "lead" }, t("tagline"))),
-      h("div", { class: "tiles" },
-        statTile(t("overview.tvl"), fmtUsd(tvl)),
-        statTile(t("overview.vol24"), fmtUsd(vol24)),
-        statTile(t("overview.vol7"), fmtUsd(vol7)),
-        statTile(t("overview.volAll"), fmtUsd(volAll)),
-        statTile(t("overview.pools"), fmtInt(live.length), healthy + " " + t("ppStatus.healthy").toLowerCase()),
-        statTile(t("overview.swaps24"), fmtInt(swaps24)),
-        statTile(t("overview.fees24"), fmtUsd(fees24))
+    main.appendChild(
+      h("section", { class: "hero" },
+        h("div", { class: "hero-text" }, h("h1", null, t("overview.title")), h("p", { class: "lead" }, t("tagline"))),
+        h("div", { class: "tiles" },
+          statTile(t("overview.tvl"), fmtUsd(tvl)),
+          statTile(t("overview.vol24"), fmtUsd(sum(live, (p) => p.vol24))),
+          statTile(t("overview.vol7"), fmtUsd(sum(live, (p) => p.vol7))),
+          statTile(t("overview.volAll"), fmtUsd(sum(everyPool, (p) => p.volAll)), t("overview.volAllSub")),
+          statTile(t("overview.pools"), fmtInt(funded.length), t("overview.poolsSub", { total: fmtInt(everyPool.length), healthy: fmtInt(healthy) })),
+          statTile(t("overview.swaps24"), fmtInt(sum(live, (p) => p.swaps24))),
+          statTile(t("overview.fees24"), fmtUsd(sum(live, (p) => p.fees24)))
+        )
       )
     );
-    main.appendChild(hero);
 
     // pulse strip
-    const pulseBody = h("div", { class: "pulse-body" }, h("p", { class: "mr-empty" }, t("common.loading") + "…"));
+    const pulseBody = h("div", { class: "pulse-body" }, empty(t("common.loading") + "…"));
     main.appendChild(section(t("overview.pulse"), t("overview.pulseHint"), pulseBody, h("div", { class: "card-foot" }, linkBtn(t("overview.seeTrades"), "#/trades", "ghost"))));
     loadPulse(pulseBody);
 
     // by chain
     const grid = h("div", { class: "grid-2" });
-    const byChain = CHAIN_IDS.map((id) => {
-      const cp = live.filter((p) => p.chainId === id);
-      return { id, tvl: sum(cp, (p) => p.tvl), vol24: sum(cp, (p) => p.vol24), vol7: sum(cp, (p) => p.vol7), n: cp.length, swaps: sum(cp, (p) => p.swaps24) };
-    });
     const chainTbl = table(
-      [{ label: t("pools.cols.chain") }, { label: t("detail.tvl"), num: true }, { label: t("pools.cols.vol24"), num: true }, { label: t("overview.poolsShort"), num: true }, { label: t("pools.cols.swaps24"), num: true }, { label: "TVL 7d", num: true }],
-      byChain.map((c) => {
-        const hist = seriesFor(c.id, "tvl", 7 * 24);
+      [{ label: t("pools.cols.chain") }, { label: t("detail.tvl"), num: true }, { label: t("pools.cols.vol24"), num: true }, { label: t("overview.poolsShort"), num: true }, { label: t("pools.cols.swaps24"), num: true }, { label: t("overview.tvl7d"), num: true }],
+      CHAIN_IDS.map((id) => {
+        const cp = live.filter((p) => p.chainId === id);
+        const hist = seriesFor(id, "tvl", 7 * 24);
         return h("tr", null,
-          td(h("a", { href: "#/pools?chain=" + c.id }, chainChip(c.id, true))),
-          td(fmtUsd(c.tvl), "num"), td(fmtUsd(c.vol24), "num"), td(fmtInt(c.n), "num"), td(fmtInt(c.swaps), "num"),
-          td(hist.length > 1 ? MR.sparkline(hist, SERIES[c.id], 90, 28) : "—", "num spark")
+          td(h("a", { href: "#/pools?chain=" + id }, chainChip(id, true))),
+          td(fmtUsd(sum(cp, (p) => p.tvl)), "num"), td(fmtUsd(sum(cp, (p) => p.vol24)), "num"), td(fmtInt(cp.filter(isFunded).length), "num"), td(fmtInt(sum(cp, (p) => p.swaps24)), "num"),
+          td(hist.length > 1 ? MR.sparkline(hist, SERIES[id], 90, 28) : t("common.na"), "num spark")
         );
       }),
       { cls: "compact" }
@@ -336,21 +405,20 @@
 
     // tier mix
     const tierCounts = {};
-    live.forEach((p) => {
+    funded.forEach((p) => {
       const k = tierOf(p);
       tierCounts[k] = tierCounts[k] || { n: 0, tvl: 0 };
       tierCounts[k].n++;
       tierCounts[k].tvl += p.tvl || 0;
     });
-    const order = ["green", "yellow", "red", "private", "unclassified"];
     const seg = h("div", { class: "segbar", role: "img", "aria-label": t("overview.tierMix") });
     const legend = h("div", { class: "seg-legend" });
-    order.forEach((k) => {
+    ["green", "yellow", "red", "private", "unclassified"].forEach((k) => {
       const c = tierCounts[k];
       if (!c || !c.tvl) return;
       const w = (c.tvl / Math.max(1, tvl)) * 100;
       seg.appendChild(h("div", { class: "seg tier-" + k, style: "width:" + w + "%", title: t("tiers." + k) + " " + fmtUsd(c.tvl) }));
-      legend.appendChild(h("div", { class: "seg-item" }, h("span", { class: "chip tier tier-" + k }, h("i", { class: "sw" }), t("tiers." + k)), h("span", { class: "num" }, fmtInt(c.n) + " · " + fmtUsd(c.tvl) + " · " + (w).toFixed(0) + "%")));
+      legend.appendChild(h("div", { class: "seg-item" }, h("span", { class: "chip tier tier-" + k }, h("i", { class: "sw" }), t("tiers." + k)), h("span", { class: "num" }, fmtInt(c.n) + " · " + fmtUsd(c.tvl) + " · " + w.toFixed(0) + "%")));
     });
     grid.appendChild(section(t("overview.tierMix"), null, seg, legend));
     main.appendChild(grid);
@@ -359,8 +427,9 @@
     const grid2 = h("div", { class: "grid-2" });
     const topVol = live.filter((p) => p.vol24).sort((a, b) => b.vol24 - a.vol24).slice(0, 8);
     grid2.appendChild(section(t("overview.topPools"), null, miniPoolTable(topVol, "vol24")));
+    // outsiders cannot deposit into private pools, so they do not belong in a list people read for yield
     const topApr = live
-      .filter((p) => (p.tvl || 0) >= 10000 && markout(p, "7d", "5m") && markout(p, "7d", "5m").aprBps != null && (markout(p, "7d", "5m").priced || 0) >= 0.7)
+      .filter((p) => !p.private && (p.tvl || 0) >= 10000 && markout(p, "7d", "5m") && markout(p, "7d", "5m").aprBps != null && (markout(p, "7d", "5m").priced || 0) >= 0.7)
       .sort((a, b) => markout(b, "7d", "5m").aprBps - markout(a, "7d", "5m").aprBps)
       .slice(0, 8);
     grid2.appendChild(section(t("overview.topApr"), null, miniPoolTable(topApr, "markout")));
@@ -375,9 +444,9 @@
     main.appendChild(histWrap);
     requestAnimationFrame(() => {
       const hs = CHAIN_IDS.map((id) => ({ name: chainName(id), color: SERIES[id], points: seriesFor(id, "tvl", 24 * 90) }));
-      MR.lineChart(tvlChart, { series: hs, yFmt: fmtUsd, xFmt: (x, full) => fmtDate(x, !!full), area: true, emptyText: t("overview.historyEmpty"), tableLabel: t("common.tableView"), xLabel: t("trades.cols.time") });
+      MR.lineChart(tvlChart, { series: hs, yFmt: fmtUsd, xFmt: (x, full) => fmtDate(x, !!full), emptyText: t("overview.historyEmpty"), tableLabel: t("common.tableView"), xLabel: t("trades.cols.time") });
       const vs = CHAIN_IDS.map((id) => ({ name: chainName(id), color: SERIES[id], points: dailySeriesFor(id, "vol24") }));
-      MR.lineChart(volChart, { series: vs, yFmt: fmtUsd, xFmt: (x, full) => fmtDate(x, false), emptyText: t("overview.historyEmpty"), tableLabel: t("common.tableView"), xLabel: t("trades.cols.time") });
+      MR.lineChart(volChart, { series: vs, yFmt: fmtUsd, xFmt: (x) => fmtDate(x, false), emptyText: t("overview.historyEmpty"), tableLabel: t("common.tableView"), xLabel: t("trades.cols.time") });
     });
     main.appendChild(h("div", { class: "card-foot center" }, linkBtn(t("overview.seeAllPools"), "#/pools", "primary")));
   }
@@ -386,70 +455,31 @@
     if (!list.length) return empty(t("pools.empty"));
     return table(
       [{ label: t("pools.cols.pair") }, { label: t("pools.cols.chain") }, { label: t("pools.cols.tier") }, { label: t("pools.cols.tvl"), num: true }, { label: metric === "vol24" ? t("pools.cols.vol24") : t("pools.cols.markoutShort"), num: true }],
-      list.map((p) =>
-        h("tr", { class: "row-link", onclick: () => go("pool/" + p.chainId + "/" + p.address) },
+      list.map((p) => {
+        const mk = markout(p, "7d", "5m");
+        return h("tr", { class: "row-link", onclick: () => go("pool/" + p.chainId + "/" + p.address) },
           td(h("a", { href: "#/pool/" + p.chainId + "/" + p.address }, pairCell(p))),
           td(chainChip(p.chainId)),
           td(tierChip(p)),
           td(fmtUsd(p.tvl), "num"),
-          td(metric === "vol24" ? fmtUsd(p.vol24) : fmtBps(markout(p, "7d", "5m") && markout(p, "7d", "5m").aprBps, true), "num " + (metric !== "vol24" ? signCls(markout(p, "7d", "5m") && markout(p, "7d", "5m").aprBps) : ""))
-        )
-      ),
+          td(metric === "vol24" ? fmtUsd(p.vol24) : fmtBps(mk && mk.aprBps, true), "num " + (metric !== "vol24" ? signCls(mk && mk.aprBps) : ""))
+        );
+      }),
       { cls: "compact" }
     );
   }
-  function signCls(v) {
-    return v == null ? "" : v < 0 ? "neg" : v > 0 ? "pos" : "";
-  }
-
-  // history series: [[ts, value]]
-  function seriesFor(chainId, field, maxPoints) {
-    const hst = S.data && S.data.history;
-    if (!hst || !hst.hourly || !hst.hourly[chainId]) return [];
-    const idx = { ts: 0, tvl: 1, vol24: 2, pools: 3, swaps24: 4 };
-    return hst.hourly[chainId].slice(-(maxPoints || 1000)).map((r) => [r[0], r[idx[field]]]);
-  }
-  function dailySeriesFor(chainId, field) {
-    const hst = S.data && S.data.history;
-    if (!hst || !hst.daily || !hst.daily[chainId]) return [];
-    const idx = { ts: 0, tvl: 1, vol24: 2, pools: 3, swaps24: 4 };
-    return hst.daily[chainId].map((r) => [r[0], r[idx[field]]]);
-  }
-  function poolHistory(p) {
-    const hst = S.data && S.data.history;
-    if (!hst || !hst.pools) return [];
-    return hst.pools[histKey(p)] || [];
-  }
 
   async function loadPulse(container) {
-    const ps = pools().filter((p) => p.tier !== "black");
-    if (!ps.length) return;
-    const windowSec = 3600;
-    const rows = [];
-    let okAny = false;
-    const to = Math.floor(Date.now() / 1000);
-    await Promise.all(
-      CHAIN_IDS.map(async (id) => {
-        const cp = ps.filter((p) => p.chainId === id);
-        if (!cp.length) return;
-        try {
-          const r = await MR.recentSwaps(id, cp, windowSec, { maxCalls: 8 });
-          okAny = true;
-          S.trades.results[id + ":1h"] = r;
-          rows.push({ id, label: CONFIG.chains[id].short + " · " + r.swaps.length, color: SERIES[id], dots: r.swaps.map((s) => ({ t: s.ts, usd: s.usd || 0, href: explorerTx(id, s.tx), title: `<div class="mr-tip-head">${esc(s.pair)} · ${fmtTime(s.ts)}</div><div>${s.side === "sell" ? t("trades.sell") : t("trades.buy")} ${esc(fmtNum(s.amountIn))} ${esc(s.tokIn.sym)} → ${esc(fmtNum(s.amountOut))} ${esc(s.tokOut.sym)}</div><b>${fmtUsd(s.usd)}</b>` })) });
-        } catch (e) {
-          rows.push({ id, label: CONFIG.chains[id].short + " · —", color: SERIES[id], dots: [] });
-        }
-      })
-    );
+    const results = await pulseData();
     if (!container.isConnected) return;
-    if (!okAny) {
-      container.innerHTML = "";
+    container.innerHTML = "";
+    if (!results.some((x) => x.r)) {
       container.appendChild(empty(t("overview.pulseUnavailable")));
       return;
     }
-    rows.sort((a, b) => CHAIN_IDS.indexOf(a.id) - CHAIN_IDS.indexOf(b.id));
-    MR.pulseStrip(container, rows, to - windowSec, to, { xFmt: (x) => fmtTime(x).slice(0, 5) });
+    const to = Math.floor(Date.now() / 1000);
+    const rows = results.map((x) => ({ label: CONFIG.chains[x.id].short + " · " + (x.r ? fmtInt(x.r.swaps.length) : t("common.na")), color: SERIES[x.id], dots: x.r ? swapDots(x.r.swaps, 300) : [] }));
+    MR.pulseStrip(container, rows, to - PULSE_SECONDS, to, { xFmt: (x) => fmtTime(x).slice(0, 5) });
   }
 
   // ----- pools -----
@@ -467,19 +497,21 @@
       return h("label", { class: "f" }, h("span", null, label), s);
     };
     filters.appendChild(sel(t("pools.cols.chain"), V.chain, [["all", t("chains.all")], ...CHAIN_IDS.map((id) => [id, chainName(id)])], (v) => { V.chain = v; drawRows(); }));
-    const tierBox = h("div", { class: "f" }, h("span", null, t("pools.tier")), h("div", { class: "chips" }, ...["green", "yellow", "red", "unclassified"].map((k) => {
-      const b = h("button", { type: "button", class: "chip tier tier-" + k + (V.tier.has(k) ? " on" : ""), "aria-pressed": String(V.tier.has(k)), onclick: (e) => { if (V.tier.has(k)) V.tier.delete(k); else V.tier.add(k); e.currentTarget.classList.toggle("on"); e.currentTarget.setAttribute("aria-pressed", String(V.tier.has(k))); drawRows(); } }, h("i", { class: "sw" }), t("tiers." + k));
-      return b;
-    })));
+    const tierBox = h("div", { class: "f" }, h("span", null, t("pools.tier")), h("div", { class: "chips" }, ...["green", "yellow", "red", "unclassified"].map((k) =>
+      h("button", { type: "button", class: "chip tier tier-" + k + (V.tier.has(k) ? " on" : ""), "aria-pressed": String(V.tier.has(k)), onclick: (e) => { if (V.tier.has(k)) V.tier.delete(k); else V.tier.add(k); e.currentTarget.classList.toggle("on"); e.currentTarget.setAttribute("aria-pressed", String(V.tier.has(k))); drawRows(); } }, h("i", { class: "sw" }), t("tiers." + k))
+    )));
     filters.appendChild(tierBox);
-    filters.appendChild(sel(t("pools.minTvl"), V.minTvl, [[0, t("common.all")], [1000, "$1K"], [10000, "$10K"], [100000, "$100K"], [1000000, "$1M"]], (v) => { V.minTvl = Number(v); drawRows(); }));
+    const tvlSel = sel(t("pools.minTvl"), V.minTvl, [[0, t("common.all")], [1000, "$1K"], [10000, "$10K"], [100000, "$100K"], [1000000, "$1M"]], (v) => { V.minTvl = Number(v); drawRows(); });
+    filters.appendChild(tvlSel);
     filters.appendChild(sel(t("pools.sort"), V.sort, Object.keys(I18N.en.pools.sorts).map((k) => [k, t("pools.sorts." + k)]), (v) => { V.sort = v; drawRows(); }));
-    const toggles = h("div", { class: "f toggles" },
-      h("label", null, h("input", { type: "checkbox", checked: V.healthy ? "checked" : null, onchange: (e) => { V.healthy = e.target.checked; drawRows(); } }), t("pools.onlyHealthy")),
-      h("label", null, h("input", { type: "checkbox", checked: V.verified ? "checked" : null, onchange: (e) => { V.verified = e.target.checked; drawRows(); } }), t("pools.onlyVerified")),
-      h("label", null, h("input", { type: "checkbox", checked: V.hidePrivate ? "checked" : null, onchange: (e) => { V.hidePrivate = e.target.checked; drawRows(); } }), t("pools.hidePrivate"))
-    );
-    filters.appendChild(toggles);
+    const check = (key, label, after) => h("label", null, h("input", { type: "checkbox", checked: V[key] ? "checked" : null, onchange: (e) => { V[key] = e.target.checked; if (after) after(); drawRows(); } }), label);
+    filters.appendChild(h("div", { class: "f toggles" },
+      check("healthy", t("pools.onlyHealthy")),
+      check("verified", t("pools.onlyVerified")),
+      check("hidePrivate", t("pools.hidePrivate")),
+      // empty pools sit below every TVL floor: showing them only makes sense with the floor removed
+      check("showEmpty", t("pools.showEmpty"), () => { if (V.showEmpty) { V.minTvl = 0; $("select", tvlSel).value = "0"; } })
+    ));
     const search = h("input", { type: "search", class: "search", placeholder: t("pools.search"), value: V.q, "aria-label": t("pools.search"), oninput: (e) => { V.q = e.target.value.trim().toLowerCase(); drawRows(); } });
     filters.appendChild(h("div", { class: "f grow" }, search));
     main.appendChild(filters);
@@ -488,19 +520,18 @@
     const wrap = h("div");
     main.appendChild(count);
     main.appendChild(wrap);
-    const actions = $(".page-actions", head);
-    const csvBtn = h("button", { type: "button", class: "btn ghost", onclick: () => exportCsv(filtered()) }, t("pools.export"));
-    actions.appendChild(csvBtn);
+    $(".page-actions", head).appendChild(h("button", { type: "button", class: "btn ghost", onclick: () => exportCsv(filtered()) }, t("pools.export")));
 
     function filtered() {
       let list = pools().filter((p) => p.tier !== "black");
+      list = V.showEmpty ? list.concat(emptyPools()) : list.filter(isFunded);
       if (V.chain !== "all") list = list.filter((p) => String(p.chainId) === String(V.chain));
       list = list.filter((p) => V.tier.has(p.tier || "unclassified") || (p.private && V.tier.size));
       if (V.hidePrivate) list = list.filter((p) => !p.private);
       if (V.minTvl) list = list.filter((p) => (p.tvl || 0) >= V.minTvl);
       if (V.healthy) list = list.filter((p) => p.ppStatus === "healthy" && !(p.pauseLevel > 0));
       if (V.verified) list = list.filter((p) => p.verifiedAdmin);
-      if (V.q) list = list.filter((p) => (p.pair + " " + p.address + " " + p.t0.name + " " + p.t1.name + " " + (p.adminName || "")).toLowerCase().includes(V.q));
+      if (V.q) list = list.filter((p) => (p.pair + " " + p.address + " " + (p.t0.name || "") + " " + (p.t1.name || "") + " " + (p.adminName || "")).toLowerCase().includes(V.q));
       const key = {
         tvl: (p) => p.tvl, vol24: (p) => p.vol24, vol7: (p) => p.vol7, apr7: (p) => p.apr7Bps, pnl: (p) => p.pnlApr7Bps, created: (p) => p.created, fees24: (p) => p.fees24, swaps24: (p) => p.swaps24,
         markout: (p) => (markout(p, "7d", "5m") ? markout(p, "7d", "5m").aprBps : null),
@@ -516,7 +547,8 @@
     }
     function drawRows() {
       const list = filtered();
-      count.textContent = t("pools.count", { n: list.length });
+      const hidden = V.showEmpty ? 0 : pools().filter((p) => p.tier !== "black" && !isFunded(p)).length + emptyPools().length;
+      count.textContent = t("pools.count", { n: fmtInt(list.length) }) + (hidden ? " · " + t("pools.emptyHidden", { n: fmtInt(hidden) }) : "");
       wrap.innerHTML = "";
       if (!list.length) {
         wrap.appendChild(empty(t("pools.empty")));
@@ -528,7 +560,8 @@
         { label: t("pools.cols.apr7"), num: true }, { label: t("pools.cols.markout"), num: true }, { label: t("pools.cols.pnl"), num: true },
         { label: t("pools.cols.fees24"), num: true }, { label: t("pools.cols.swaps24"), num: true }, { label: t("pools.cols.curator") }, { label: t("pools.cols.age"), num: true },
       ];
-      const rows = list.map((p) => {
+      // a very long table makes the page sluggish: draw the first 400 rows and say so
+      const rows = list.slice(0, 400).map((p) => {
         const mk = markout(p, "7d", "5m");
         return h("tr", { class: "row-link", onclick: (e) => { if (e.target.closest("a")) return; go("pool/" + p.chainId + "/" + p.address); } },
           td(h("a", { href: "#/pool/" + p.chainId + "/" + p.address }, pairCell(p))),
@@ -548,12 +581,13 @@
         );
       });
       wrap.appendChild(table(cols, rows, { cls: "pools" }));
+      if (list.length > rows.length) wrap.appendChild(note(t("pools.truncated", { shown: fmtInt(rows.length), n: fmtInt(list.length) })));
     }
     drawRows();
   }
   function curatorCell(p) {
     const name = p.adminName || short(p.admin || p.creator);
-    return h("span", { class: "curator" + (p.verifiedAdmin ? " verified" : "") , title: p.verifiedAdmin ? t("detail.verified") : t("detail.unverified") }, p.verifiedAdmin ? h("i", { class: "check" }) : null, name);
+    return h("span", { class: "curator" + (p.verifiedAdmin ? " verified" : ""), title: p.verifiedAdmin ? t("detail.verified") : t("detail.unverified") }, p.verifiedAdmin ? h("i", { class: "check" }) : null, name);
   }
   function exportCsv(list) {
     const cols = ["chainId", "pair", "address", "tier", "private", "ppStatus", "tvl", "vol24", "vol7", "vol30", "volAll", "fees24", "swaps24", "apr7Bps", "pnlApr7Bps", "markout7d5mAprBps", "protocolFeeE6", "adminFeeE6", "verifiedAdmin", "adminName", "created"];
@@ -571,11 +605,39 @@
   }
 
   // ----- pool detail -----
+  /** The snapshot keeps only a slim record for empty pools, and knows nothing of pools created after it: fetch those. */
+  function ensureFullPool(chainId, addr, p) {
+    const key = chainId + ":" + addr.toLowerCase();
+    if ((p && !p.slim) || S.poolFetch[key] || !CHAIN_IDS.includes(Number(chainId)) || !/^0x[0-9a-fA-F]{40}$/.test(addr)) return S.poolFetch[key] || null;
+    S.poolFetch[key] = "loading";
+    MR.api.poolMeta(Number(chainId), addr).then(
+      (full) => {
+        if (!full || !S.data) {
+          S.poolFetch[key] = "failed";
+          return;
+        }
+        delete S.poolFetch[key];
+        S.data = { ...S.data, pools: pools().filter((x) => MR.poolKey(x) !== key).concat([full]), index: emptyPools().filter((x) => MR.poolKey(x) !== key) };
+      },
+      () => {
+        S.poolFetch[key] = "failed";
+      }
+    ).then(() => {
+      const r = parseRoute();
+      if (r.name === "pool" && String(r.parts[1]) === String(chainId) && (r.parts[2] || "").toLowerCase() === addr.toLowerCase()) render({ keepScroll: true });
+    });
+    return "loading";
+  }
   function viewPool(main) {
     const [, chainId, addr] = S.route.parts;
-    const p = poolByKey(chainId, addr || "");
+    let p = findPool(chainId, addr || "");
+    const fetching = ensureFullPool(chainId, addr || "", p);
+    if (fetching === "loading") {
+      main.appendChild(h("div", { class: "loading" }, h("div", { class: "spinner" }), h("p", null, t("common.loading") + "…")));
+      return;
+    }
     if (!p) {
-      main.appendChild(h("p", { class: "mr-empty" }, t("pools.empty")));
+      main.appendChild(empty(t("detail.notFound")));
       main.appendChild(linkBtn(t("detail.back"), "#/pools", "ghost"));
       return;
     }
@@ -584,7 +646,7 @@
     main.appendChild(h("div", { class: "page-head" },
       h("div", null, h("a", { class: "back", href: "#/pools" }, "← " + t("detail.back")),
         h("h1", { class: "pool-title" }, h("span", { class: "tok-pair big" }, tokenLogo(p.t0, 28), tokenLogo(p.t1, 28)), p.pair),
-        h("div", { class: "chips-row" }, chainChip(p.chainId), tierChip(p), statusChip(p), p.locked ? h("span", { class: "chip" }, t("detail.locked")) : h("span", { class: "chip warn" }, t("detail.changeable")))),
+        h("div", { class: "chips-row" }, chainChip(p.chainId), tierChip(p), statusChip(p), p.slim ? null : p.locked ? h("span", { class: "chip" }, t("detail.locked")) : h("span", { class: "chip warn" }, t("detail.changeable")))),
       h("div", { class: "page-actions" },
         linkBtn(t("detail.openOnMetric"), poolUrl(p), "primary"),
         linkBtn(t("detail.explorer"), explorerAddr(p.chainId, p.address), "ghost"),
@@ -592,6 +654,7 @@
         h("button", { type: "button", class: "btn ghost", onclick: (e) => { navigator.clipboard && navigator.clipboard.writeText(p.address); e.currentTarget.textContent = t("detail.copied"); } }, t("detail.copyAddr")))
     ));
     main.appendChild(h("p", { class: "addr num" }, p.address));
+    if (p.slim) main.appendChild(note(t("detail.slimNote")));
 
     // summary tiles
     main.appendChild(h("div", { class: "tiles four" },
@@ -610,28 +673,29 @@
     const tier = tierOf(p);
     const reasons = h("div", null,
       h("p", null, h("span", { class: "chip tier tier-" + tier }, h("i", { class: "sw" }), t("tiers." + tier)), " ", t("tiers.desc." + tier)),
-      p.reasons.length ? h("ul", { class: "reasons" }, ...p.reasons.map((r) => h("li", null, h("code", null, r), " — ", t("reasons." + r) === "reasons." + r ? r : t("reasons." + r)))) : h("p", { class: "ok" }, t("detail.noReasons")),
+      p.reasons.length ? h("ul", { class: "reasons" }, ...p.reasons.map((r) => h("li", null, h("code", null, r), " — ", t("reasons." + r) === "reasons." + r ? r : t("reasons." + r)))) : p.slim ? null : h("p", { class: "ok" }, t("detail.noReasons")),
       h("p", { class: "risk" }, t("detail.riskNote"))
     );
     grid.appendChild(section(t("detail.reasonsTitle"), null, reasons));
 
     // curator & fees
     const lpShare = p.protocolFeeE6 != null && p.adminFeeE6 != null ? 1 - (p.protocolFeeE6 + p.adminFeeE6) / 1e6 : null;
+    const notional = (p.protocolNotionalE8 || 0) + (p.adminNotionalE8 || 0);
     const feeRows = [
       [p.verifiedAdmin ? t("detail.curator") : t("detail.operator"), h("span", { class: "curator-cell" }, curatorCell(p), p.admin && p.adminName ? h("a", { class: "sub", href: explorerAddr(p.chainId, p.admin), target: "_blank", rel: "noopener" }, short(p.admin)) : null, " ", h("small", null, p.verifiedAdmin ? t("detail.verified") : t("detail.unverified")))],
-      [t("detail.creator"), h("a", { href: explorerAddr(p.chainId, p.creator || ""), target: "_blank", rel: "noopener" }, short(p.creator))],
+      [t("detail.creator"), p.creator ? h("a", { href: explorerAddr(p.chainId, p.creator), target: "_blank", rel: "noopener" }, short(p.creator)) : t("common.na")],
       [t("detail.created"), fmtDate(p.created, true) + " · " + ageText(p)],
-      [t("detail.protocolShare"), p.protocolFeeE6 != null ? fmtPct(p.protocolFeeE6 / 1e6) : t("common.na")],
-      [t("detail.adminShare"), p.adminFeeE6 != null ? fmtPct(p.adminFeeE6 / 1e6) : t("common.na")],
-      [t("detail.lpShare"), lpShare != null ? fmtPct(lpShare) : t("common.na")],
-      [t("detail.notional"), (p.protocolNotionalE8 || 0) + (p.adminNotionalE8 || 0) > 0 ? fmtPct(((p.protocolNotionalE8 || 0) + (p.adminNotionalE8 || 0)) / 1e8, 3) : "0%"],
+      [t("detail.protocolShare"), p.protocolFeeE6 != null ? fmtPctSmart(p.protocolFeeE6 / 1e6) : t("common.na")],
+      [t("detail.adminShare"), p.adminFeeE6 != null ? fmtPctSmart(p.adminFeeE6 / 1e6) : t("common.na")],
+      [t("detail.lpShare"), lpShare != null ? fmtPctSmart(lpShare) : t("common.na")],
+      [t("detail.notional"), p.protocolNotionalE8 == null && p.adminNotionalE8 == null ? t("common.na") : notional > 0 ? fmtPctSmart(notional / 1e8) : "0%"],
     ];
     grid.appendChild(section(t("detail.fees"), t("detail.feesHint"), kv(feeRows)));
     main.appendChild(grid);
 
     // markout table
-    const windows = ["24h", "7d", "30d", "all"], horizons = ["1m", "5m", "30m"];
-    const mkRows = windows.map((w) => h("tr", null, td(w), ...horizons.map((hz) => {
+    const horizons = ["1m", "5m", "30m"];
+    const mkRows = PERIODS.map((w) => h("tr", null, td(w), ...horizons.map((hz) => {
       const m = markout(p, w, hz);
       if (!m) return td(t("common.na"), "num");
       return td(h("span", { title: (m.priced != null ? t("detail.priced") + " " + fmtPct(m.priced, 0) : "") + (m.tradedBins != null ? " · " + t("detail.tradedBins") + " " + m.tradedBins + "/" + (m.fundedBins != null ? m.fundedBins : "?") : "") },
@@ -642,32 +706,38 @@
     // pricing & guards
     const grid3 = h("div", { class: "grid-2" });
     const d = p.ppDetails || {};
+    const addrLink = (a) => (a ? h("a", { href: explorerAddr(p.chainId, a), target: "_blank", rel: "noopener" }, short(a)) : t("common.na"));
     const prRows = [
-      [t("detail.providerType"), d.providerType === "anchored" ? t("detail.anchored") : d.providerType === "regular" ? t("detail.regular") : t("detail.customProvider")],
-      [t("detail.pricing"), h("a", { href: explorerAddr(p.chainId, p.ppAddress || ""), target: "_blank", rel: "noopener" }, short(p.ppAddress))],
-      [t("detail.locked"), p.locked ? t("common.yes") : t("common.no")],
+      [t("detail.providerType"), d.providerType === "anchored" ? t("detail.anchored") : d.providerType === "regular" ? t("detail.regular") : p.slim ? t("common.na") : t("detail.customProvider")],
+      [t("detail.pricing"), addrLink(p.ppAddress)],
+      [t("detail.locked"), p.slim ? t("common.na") : p.locked ? t("common.yes") : t("common.no")],
       [t("detail.cooldown"), p.cooldown && BigInt(p.cooldown) >= 2n ** 53n ? "∞" : p.cooldown ? fmtDur(Number(p.cooldown)) : t("common.na")],
       [t("detail.staleness"), d.maxRefStaleness != null ? d.maxRefStaleness + " s" : d.maxTimeDelta != null ? d.maxTimeDelta + " s" : t("common.na")],
-      [t("detail.oracle"), d.oracle ? h("a", { href: explorerAddr(p.chainId, d.oracle), target: "_blank", rel: "noopener" }, short(d.oracle)) : t("common.na")],
+      [t("detail.oracle"), addrLink(d.oracle)],
       [t("detail.feedMode"), d.feedMode || t("common.na")],
-      [t("detail.source"), d.source ? h("a", { href: explorerAddr(p.chainId, d.source), target: "_blank", rel: "noopener" }, short(d.source)) : t("common.na")],
+      [t("detail.source"), addrLink(d.source)],
     ];
     grid3.appendChild(section(t("detail.pricing"), null, kv(prRows)));
     const ext = p.extDetails || {};
     const sl = ext.stopLoss;
     const pv = ext.priceVelocity;
+    const part = (label, value) => label + " " + (value != null ? value : "?");
     const gRows = [
-      [t("detail.stopLoss"), sl ? h("span", null, t("detail.drawdown") + " " + (sl.drawdownE6 != null ? fmtPct(Number(sl.drawdownE6) / 1e6, 0) : "?") + " · " + t("detail.decay") + " " + (sl.decayPerSecondE18 != null ? fmtPct((Number(sl.decayPerSecondE18) / 1e18) * 86400, 1) : "?") + " · " + t("detail.timelock") + " " + (sl.timelockSecs != null ? (Number(sl.timelockSecs) >= 1099511627775 ? t("detail.locked40") : fmtDur(Number(sl.timelockSecs))) : "?")) : t("detail.none")],
-      [t("detail.velocity"), pv ? t("detail.maxChange") + " " + (pv.maxChangePerBlockE18 != null ? fmtPct(Number(pv.maxChangePerBlockE18) / 1e18, 2) : "?") : t("detail.none")],
-      [t("detail.extensions"), p.extensions.length ? h("span", { class: "addr-list" }, ...p.extensions.map((a) => h("a", { href: explorerAddr(p.chainId, a), target: "_blank", rel: "noopener" }, short(a)))) : t("detail.none")],
+      [t("detail.stopLoss"), sl ? [
+        part(t("detail.drawdown"), sl.drawdownE6 != null ? fmtPctSmart(Number(sl.drawdownE6) / 1e6) : null),
+        part(t("detail.decay"), sl.decayPerSecondE18 != null ? fmtPctSmart((Number(sl.decayPerSecondE18) / 1e18) * 86400) : null),
+        part(t("detail.timelock"), sl.timelockSecs != null ? (Number(sl.timelockSecs) >= 1099511627775 ? t("detail.locked40") : fmtDur(Number(sl.timelockSecs))) : null),
+      ].join(" · ") : p.slim ? t("common.na") : t("detail.none")],
+      [t("detail.velocity"), pv ? part(t("detail.maxChange"), pv.maxChangePerBlockE18 != null ? fmtPctSmart(Number(pv.maxChangePerBlockE18) / 1e18) : null) : p.slim ? t("common.na") : t("detail.none")],
+      [t("detail.extensions"), p.extensions.length ? h("span", { class: "addr-list" }, ...p.extensions.map((a) => h("a", { href: explorerAddr(p.chainId, a), target: "_blank", rel: "noopener" }, short(a)))) : p.slim ? t("common.na") : t("detail.none")],
       [t("detail.activeBin"), p.curBinIdx != null ? "#" + p.curBinIdx : t("common.na")],
     ];
     grid3.appendChild(section(t("detail.guards"), null, kv(gRows)));
     main.appendChild(grid3);
 
     // tokens
-    const tokRows = [p.t0, p.t1].map((tk, i) => h("tr", null, td(h("span", { class: "pair" }, tokenLogo(tk, 20), " ", tk.sym, h("small", { class: "sub" }, tk.name))), td(h("a", { href: explorerAddr(p.chainId, tk.addr), target: "_blank", rel: "noopener" }, short(tk.addr))), td(tk.dec, "num"), td(fmtUsdFull(tk.price), "num"), td(fmtUsd(i === 0 ? p.liq0 : p.liq1), "num")));
-    main.appendChild(section(t("detail.tokens"), null, table([{ label: t("detail.tokens") }, { label: "Address" }, { label: "Decimals", num: true }, { label: t("detail.price"), num: true }, { label: t("detail.liquidity"), num: true }], tokRows, { cls: "compact" })));
+    const tokRows = [p.t0, p.t1].map((tk, i) => h("tr", null, td(h("span", { class: "pair" }, tokenLogo(tk, 20), " ", tk.sym, h("small", { class: "sub" }, tk.name))), td(addrLink(tk.addr)), td(tk.dec, "num"), td(fmtUsdFull(tk.price), "num"), td(fmtUsd(i === 0 ? p.liq0 : p.liq1), "num")));
+    main.appendChild(section(t("detail.tokens"), null, table([{ label: t("detail.tokens") }, { label: t("detail.address") }, { label: t("detail.decimals"), num: true }, { label: t("detail.price"), num: true }, { label: t("detail.liquidity"), num: true }], tokRows, { cls: "compact" })));
 
     // depth ladder (live)
     const depthBody = h("div");
@@ -677,21 +747,21 @@
     const binsBody = h("div");
     const binsBtn = h("button", { type: "button", class: "btn", onclick: () => loadBins(p, binsBody, binsBtn) }, t("detail.binsLoad"));
     main.appendChild(section(t("detail.bins"), t("detail.binsHint"), h("div", { class: "card-foot" }, binsBtn), binsBody));
-    if (S.status.source === "live") {
+    if (S.status.api !== "down") {
       loadDepth(p, depthBody, depthBtn);
       loadBins(p, binsBody, binsBtn);
     }
 
-    // history
+    // history: TVL and volume differ by orders of magnitude, so each gets its own axis
     const hist = poolHistory(p);
-    const hc = h("div", { class: "chart" });
-    main.appendChild(section(t("detail.history"), null, hc));
+    const tvlChart = h("div", { class: "chart" });
+    const volChart = h("div", { class: "chart" });
+    main.appendChild(h("div", { class: "grid-2" }, section(t("detail.history") + " · " + t("detail.tvl"), null, tvlChart), section(t("detail.history") + " · " + t("detail.vol24"), null, volChart)));
     requestAnimationFrame(() => {
-      MR.lineChart(hc, { series: [{ name: t("detail.tvl"), color: SERIES[p.chainId], points: hist.map((r) => [r[0], r[1]]) }, { name: t("detail.vol24"), color: "var(--series-4)", points: hist.map((r) => [r[0], r[2]]) }], yFmt: fmtUsd, xFmt: (x, full) => fmtDate(x, !!full), emptyText: t("detail.historyEmpty"), tableLabel: t("common.tableView") });
+      const common = { yFmt: fmtUsd, xFmt: (x, full) => fmtDate(x, !!full), emptyText: t("detail.historyEmpty"), tableLabel: t("common.tableView"), xLabel: t("trades.cols.time") };
+      MR.lineChart(tvlChart, { ...common, area: true, series: [{ name: t("detail.tvl"), color: SERIES[p.chainId], points: hist.map((r) => [r[0], r[1]]) }] });
+      MR.lineChart(volChart, { ...common, series: [{ name: t("detail.vol24"), color: "var(--series-4)", points: hist.map((r) => [r[0], r[2]]) }] });
     });
-  }
-  function kv(rows) {
-    return h("dl", { class: "kv" }, ...rows.map(([k, v]) => h("div", { class: "kv-row" }, h("dt", null, k), h("dd", null, v))));
   }
   async function loadDepth(p, body, btn) {
     btn.disabled = true;
@@ -724,11 +794,11 @@
         });
         return table([{ label: t("detail.level"), num: true }, { label: t("detail.price"), num: true }, { label: t("detail.cumIn"), num: true }, { label: t("detail.cumOut"), num: true }, { label: t("detail.impact"), num: true }], rows, { cls: "compact depth" });
       };
-      body.appendChild(h("div", { class: "grid-2" }, h("div", null, h("h3", null, t("detail.bidSide")), depth.bids.length ? mkSide(depth.bids, true) : empty(t("detail.unavailableSide"))), h("div", null, h("h3", null, t("detail.askSide")), depth.asks.length ? mkSide(depth.asks, false) : empty(t("detail.unavailableSide")))));
+      body.appendChild(h("div", { class: "grid-2" }, h("div", null, h("h3", null, t("detail.bidSide")), (depth.bids || []).length ? mkSide(depth.bids, true) : empty(t("detail.unavailableSide"))), h("div", null, h("h3", null, t("detail.askSide")), (depth.asks || []).length ? mkSide(depth.asks, false) : empty(t("detail.unavailableSide")))));
       btn.textContent = t("trades.refresh");
     } catch (e) {
       body.innerHTML = "";
-      body.appendChild(empty(t("detail.depthFail") + " (" + esc(e.message || e) + ")"));
+      body.appendChild(empty(t("detail.depthFail") + " (" + (e.message || e) + ")"));
       btn.textContent = t("common.retry");
     } finally {
       btn.disabled = false;
@@ -748,9 +818,9 @@
       }).filter((b) => b.value > 0 || b.vol > 0 || b.active);
       const chart = h("div", { class: "chart" });
       body.appendChild(chart);
-      requestAnimationFrame(() => MR.binsChart(chart, bins, { yFmt: fmtUsd, tipHtml: (b) => `<div class="mr-tip-head">Bin #${b.bin}${b.active ? " · " + t("detail.activeBin") : ""}</div><div>${t("detail.liquidity")}: <b>${fmtUsd(b.value)}</b></div><div>7d ${t("detail.vol7").toLowerCase()}: ${fmtUsd(b.vol)}</div><div>7d LP: ${fmtUsd(b.fees)} · APR ${fmtBps(b.aprBps)}</div><div>Trading PnL APR: ${fmtBps(b.pnlAprBps, true)}</div><div>${t("detail.swaps24").replace(/24.*/, "")} ${b.swaps}</div>`, emptyText: t("detail.binsFail") }));
+      requestAnimationFrame(() => MR.binsChart(chart, bins, { yFmt: fmtUsd, tipHtml: (b) => `<div class="mr-tip-head">Bin #${b.bin}${b.active ? " · " + t("detail.activeBin") : ""}</div><div>${t("detail.liquidity")}: <b>${fmtUsd(b.value)}</b></div><div>${t("detail.vol7")}: ${fmtUsd(b.vol)}</div><div>${t("detail.binFees")}: ${fmtUsd(b.fees)} · APR ${fmtBps(b.aprBps)}</div><div>Trading PnL APR: ${fmtBps(b.pnlAprBps, true)}</div><div>${t("detail.binSwaps")}: ${fmtInt(b.swaps)}</div>`, emptyText: t("detail.binsFail") }));
       const rows = bins.map((b) => h("tr", { class: b.active ? "active" : "" }, td("#" + b.bin, "num"), td(fmtUsd(b.value), "num"), td(fmtUsd(b.vol), "num"), td(fmtUsd(b.fees), "num"), td(fmtBps(b.aprBps), "num"), td(fmtBps(b.pnlAprBps, true), "num " + signCls(b.pnlAprBps)), td(fmtInt(b.swaps), "num")));
-      const tb = table([{ label: t("detail.level"), num: true }, { label: t("detail.liquidity"), num: true }, { label: t("detail.vol7"), num: true }, { label: "7d LP", num: true }, { label: "APR", num: true }, { label: "PnL APR", num: true }, { label: "Swaps", num: true }], rows, { cls: "compact" });
+      const tb = table([{ label: t("detail.level"), num: true }, { label: t("detail.liquidity"), num: true }, { label: t("detail.vol7"), num: true }, { label: t("detail.binFees"), num: true }, { label: "APR", num: true }, { label: "PnL APR", num: true }, { label: t("detail.binSwaps"), num: true }], rows, { cls: "compact" });
       const twin = h("div", { class: "mr-table-twin" }, tb);
       twin.hidden = true;
       body.appendChild(h("button", { type: "button", class: "mr-linkbtn", onclick: () => (twin.hidden = !twin.hidden) }, t("common.tableView")));
@@ -758,7 +828,7 @@
       btn.textContent = t("trades.refresh");
     } catch (e) {
       body.innerHTML = "";
-      body.appendChild(empty(t("detail.binsFail") + " (" + esc(e.message || e) + ")"));
+      body.appendChild(empty(t("detail.binsFail") + " (" + (e.message || e) + ")"));
       btn.textContent = t("common.retry");
     } finally {
       btn.disabled = false;
@@ -768,78 +838,104 @@
   // ----- trades -----
   function viewTrades(main) {
     const T = S.trades;
+    if (!TRADE_WINDOWS[T.window]) T.window = "1h";
     main.appendChild(h("div", { class: "page-head" }, h("div", null, h("h1", null, t("trades.title")), h("p", { class: "hint" }, t("trades.hint"))),
       h("div", { class: "page-actions" },
-        h("label", { class: "f inline" }, h("span", null, t("trades.window")), h("select", { onchange: (e) => { T.window = e.target.value; runTrades(); } }, ...Object.keys(I18N.en.trades.windows).map((k) => h("option", { value: k, selected: T.window === k ? "selected" : null }, t("trades.windows." + k))))),
+        h("label", { class: "f inline" }, h("span", null, t("trades.window")), h("select", { onchange: (e) => { T.window = e.target.value; runTrades(); } }, ...Object.keys(TRADE_WINDOWS).map((k) => h("option", { value: k, selected: T.window === k ? "selected" : null }, t("trades.windows." + k))))),
         h("label", { class: "f inline" }, h("input", { type: "checkbox", checked: T.auto ? "checked" : null, onchange: (e) => { T.auto = e.target.checked; scheduleAuto(); } }), t("trades.auto")),
-        h("button", { type: "button", class: "btn primary", onclick: () => runTrades(true) }, t("trades.refresh")))));
-    const status = h("p", { class: "count" });
+        h("button", { type: "button", class: "btn primary", onclick: () => runTrades() }, t("trades.refresh")))));
+    const status = h("p", { class: "count", "aria-live": "polite" });
     const strip = h("div", { class: "pulse-body" });
     const statsEl = h("div", { class: "tiles small" });
-    const perPool = h("div");
+    const perPool = h("div", { class: "bars-2col" });
     const tbl = h("div");
     main.appendChild(status);
     main.appendChild(section(t("overview.pulse"), null, strip));
     main.appendChild(statsEl);
     main.appendChild(section(t("trades.stats.perPool"), null, perPool));
-    main.appendChild(section(t("trades.title"), null, tbl));
-    perPool.className = "bars-2col";
+    main.appendChild(section(t("trades.title"), t("trades.tableHint"), tbl));
 
-    async function runTrades(force) {
-      if (T.loading) return;
-      const sec = { "1h": 3600, "3h": 10800, "12h": 43200, "24h": 86400 }[T.window];
-      const cacheKey = (id) => id + ":" + T.window;
-      T.loading = true;
+    let busy = false;
+    async function runTrades() {
+      if (busy) return;
+      const windowKey = T.window;
+      const sec = TRADE_WINDOWS[windowKey];
+      busy = true;
       status.textContent = t("trades.loading") + "…";
       const ps = pools().filter((p) => p.tier !== "black");
       const results = [];
-      const errs = [];
+      const failed = [];
+      const pending = new Set(CHAIN_IDS);
+      const progress = {};
+      const live = () => status.isConnected && windowKey === T.window;
       await Promise.all(CHAIN_IDS.map(async (id) => {
-        const cp = ps.filter((p) => p.chainId === id);
-        if (!cp.length) return;
-        const cached = T.results[cacheKey(id)];
-        if (!force && cached && Date.now() - (cached.at || 0) < 60000) { results.push({ id, r: cached }); return; }
         try {
-          const r = await MR.recentSwaps(id, cp, sec, { maxCalls: T.window === "24h" ? 30 : 16, onProgress: () => { status.textContent = t("trades.loading") + "… " + chainName(id); } });
-          r.at = Date.now();
-          T.results[cacheKey(id)] = r;
+          const r = await MR.recentSwaps(id, ps.filter((p) => p.chainId === id), sec, { onProgress: (pr) => { progress[id] = pr.logs; if (live()) drawStatus(); } });
           results.push({ id, r });
         } catch (e) {
-          errs.push(id);
+          failed.push(id);
         }
+        pending.delete(id);
+        if (live()) draw(); // a fast chain is on screen while a slower one is still being read
       }));
-      T.loading = false;
-      if (!main.isConnected) return;
-      const all = results.flatMap((x) => x.r.swaps.map((s) => ({ ...s, chainId: x.id }))).sort((a, b) => (b.ts || 0) - (a.ts || 0));
-      const scanned = results.reduce((s, x) => s + (x.r.to - x.r.from + 1), 0);
-      status.textContent = (errs.length ? errs.map((id) => t("wallet.rpcFail", { chain: chainName(id) })).join(" ") + " " : "") + t("trades.scanned", { blocks: fmtInt(scanned) }) + (results.some((x) => !x.r.complete) ? " (partial)" : "");
-      const to = Math.floor(Date.now() / 1000);
-      const rows = results.sort((a, b) => CHAIN_IDS.indexOf(a.id) - CHAIN_IDS.indexOf(b.id)).map((x) => ({ label: CONFIG.chains[x.id].short + " · " + x.r.swaps.length, color: SERIES[x.id], dots: x.r.swaps.map((s) => ({ t: s.ts, usd: s.usd || 0, href: explorerTx(x.id, s.tx), title: `<div class="mr-tip-head">${esc(s.pair)} · ${fmtTime(s.ts)}</div><div>${s.side === "sell" ? t("trades.sell") : t("trades.buy")} ${esc(fmtNum(s.amountIn))} ${esc(s.tokIn.sym)} → ${esc(fmtNum(s.amountOut))} ${esc(s.tokOut.sym)}</div><b>${fmtUsd(s.usd)}</b>` })) }));
-      if (rows.length) MR.pulseStrip(strip, rows, to - sec, to, { xFmt: (x) => fmtTime(x).slice(0, 5) });
-      else { strip.innerHTML = ""; strip.appendChild(empty(t("trades.fail"))); }
-      const vol = sum(all, (s) => s.usd);
-      const biggest = all.reduce((m, s) => (s.usd || 0) > (m ? m.usd : 0) ? s : m, null);
-      statsEl.innerHTML = "";
-      statsEl.appendChild(statTile(t("trades.stats.count"), fmtInt(all.length)));
-      statsEl.appendChild(statTile(t("trades.stats.volume"), fmtUsd(vol)));
-      statsEl.appendChild(statTile(t("trades.stats.biggest"), biggest ? fmtUsd(biggest.usd) : t("common.na"), biggest ? biggest.pair : null));
-      statsEl.appendChild(statTile(t("trades.stats.uniq"), fmtInt(new Set(all.map((s) => s.recipient)).size)));
-      // per pool
-      const agg = new Map();
-      all.forEach((s) => { const k = s.chainId + ":" + s.pool; const a = agg.get(k) || { label: s.pair, chainId: s.chainId, pool: s.pool, usd: 0, n: 0 }; a.usd += s.usd || 0; a.n++; agg.set(k, a); });
-      const top = [...agg.values()].sort((a, b) => b.usd - a.usd).slice(0, 12);
-      MR.barRows(perPool, top.map((a) => ({ label: a.label, sub: chainName(a.chainId) + " · " + a.n, value: a.usd, color: SERIES[a.chainId], href: "#/pool/" + a.chainId + "/" + a.pool })), fmtUsd);
-      // table
-      tbl.innerHTML = "";
-      if (!all.length) tbl.appendChild(empty(t("trades.empty")));
-      else tbl.appendChild(table([{ label: t("trades.cols.time") }, { label: t("trades.cols.chain") }, { label: t("trades.cols.pool") }, { label: t("trades.cols.side") }, { label: t("trades.cols.amountIn"), num: true }, { label: t("trades.cols.amountOut"), num: true }, { label: t("trades.cols.usd"), num: true }, { label: t("trades.cols.trader") }, { label: t("trades.cols.tx") }],
-        all.slice(0, 150).map((s) => h("tr", null, td(fmtTime(s.ts), "num"), td(chainChip(s.chainId)), td(h("a", { href: "#/pool/" + s.chainId + "/" + s.pool }, s.pair || short(s.pool))), td(h("span", { class: "side " + s.side }, s.side === "sell" ? t("trades.sell") + " " + (s.tokIn ? s.tokIn.sym : "") : t("trades.buy") + " " + (s.tokOut ? s.tokOut.sym : ""))), td(s.tokIn ? fmtNum(s.amountIn) + " " + s.tokIn.sym : t("common.na"), "num"), td(s.tokOut ? fmtNum(s.amountOut) + " " + s.tokOut.sym : t("common.na"), "num"), td(fmtUsd(s.usd), "num"), td(h("a", { href: "#/wallet/" + s.recipient }, short(s.recipient))), td(h("a", { href: explorerTx(s.chainId, s.tx), target: "_blank", rel: "noopener" }, short(s.tx, 3))))),
-        { cls: "compact trades" }));
+      busy = false;
+      if (status.isConnected && windowKey !== T.window) runTrades(); // the window changed while this request was running
+
+      function drawStatus() {
+        const notes = [];
+        if (pending.size) notes.push(t("trades.loading") + "… " + [...pending].map((id) => chainName(id) + (progress[id] ? " " + fmtInt(progress[id]) : "")).join(", "));
+        else if (results.length) notes.push(t("trades.updated", { time: fmtTime(Date.now() / 1000) }));
+        else notes.push(t("trades.fail"));
+        results.forEach((x) => {
+          if (x.r.source === "api") notes.push(t("trades.apiFallback", { chain: chainName(x.id), n: x.r.poolsCovered }));
+          else if (!x.r.complete) notes.push(t("trades.truncated", { chain: chainName(x.id) }));
+        });
+        if (results.length || pending.size) failed.forEach((id) => notes.push(t("trades.chainFail", { chain: chainName(id) })));
+        status.textContent = notes.join(" · ");
+      }
+      function draw() {
+        drawStatus();
+        results.sort((a, b) => CHAIN_IDS.indexOf(a.id) - CHAIN_IDS.indexOf(b.id));
+        const all = results.flatMap((x) => x.r.swaps).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        const known = results.length > 0;
+        const to = Math.floor(Date.now() / 1000);
+        strip.innerHTML = "";
+        if (known) MR.pulseStrip(strip, results.map((x) => ({ label: CONFIG.chains[x.id].short + " · " + fmtInt(x.r.swaps.length), color: SERIES[x.id], dots: swapDots(x.r.swaps, 300) })), to - sec, to, { xFmt: (x) => fmtTime(x).slice(0, 5) });
+        else strip.appendChild(empty(pending.size ? t("common.loading") + "…" : t("trades.fail")));
+
+        const biggest = all.reduce((m, s) => ((s.usd || 0) > (m ? m.usd || 0 : 0) ? s : m), null);
+        const recipients = new Set(all.filter((s) => s.recipient).map((s) => s.recipient));
+        statsEl.innerHTML = "";
+        statsEl.appendChild(statTile(t("trades.stats.count"), known ? fmtInt(all.length) : t("common.na")));
+        statsEl.appendChild(statTile(t("trades.stats.volume"), known ? fmtUsd(sum(all, (s) => s.usd)) : t("common.na")));
+        statsEl.appendChild(statTile(t("trades.stats.biggest"), biggest ? fmtUsd(biggest.usd) : t("common.na"), biggest ? biggest.pair : null));
+        statsEl.appendChild(statTile(t("trades.stats.uniq"), recipients.size ? fmtInt(recipients.size) : t("common.na")));
+
+        const agg = new Map();
+        all.forEach((s) => { const k = s.chainId + ":" + s.pool; const a = agg.get(k) || { label: s.pair, chainId: s.chainId, pool: s.pool, usd: 0, n: 0 }; a.usd += s.usd || 0; a.n++; agg.set(k, a); });
+        const top = [...agg.values()].sort((a, b) => b.usd - a.usd).slice(0, 12);
+        if (top.length) MR.barRows(perPool, top.map((a) => ({ label: a.label, sub: chainName(a.chainId) + " · " + fmtInt(a.n), value: a.usd, color: SERIES[a.chainId], href: "#/pool/" + a.chainId + "/" + a.pool })), fmtUsd);
+        else { perPool.innerHTML = ""; perPool.appendChild(empty(pending.size ? t("common.loading") + "…" : t("trades.empty"))); }
+
+        tbl.innerHTML = "";
+        if (!all.length) tbl.appendChild(empty(pending.size ? t("common.loading") + "…" : known ? t("trades.empty") : t("trades.fail")));
+        else tbl.appendChild(table([{ label: t("trades.cols.time") }, { label: t("trades.cols.chain") }, { label: t("trades.cols.pool") }, { label: t("trades.cols.side") }, { label: t("trades.cols.amountIn"), num: true }, { label: t("trades.cols.amountOut"), num: true }, { label: t("trades.cols.usd"), num: true }, { label: t("trades.cols.trader") }, { label: t("trades.cols.tx") }],
+          all.slice(0, 150).map((s) => h("tr", null, td(fmtTime(s.ts), "num"), td(chainChip(s.chainId)), td(h("a", { href: "#/pool/" + s.chainId + "/" + s.pool }, s.pair)), td(sideCell(s)), td(fmtNum(s.amountIn) + " " + s.tokIn.sym, "num"), td(fmtNum(s.amountOut) + " " + s.tokOut.sym, "num"), td(fmtUsd(s.usd), "num"), td(s.recipient ? h("a", { href: "#/wallet/" + s.recipient }, short(s.recipient)) : t("common.na")), td(h("a", { href: explorerTx(s.chainId, s.tx), target: "_blank", rel: "noopener" }, short(s.tx, 3))))),
+          { cls: "compact trades" }));
+      }
     }
     function scheduleAuto() {
       if (T.timer) clearInterval(T.timer);
       T.timer = null;
-      if (T.auto) T.timer = setInterval(() => { if (main.isConnected) runTrades(true); else clearInterval(T.timer); }, 60000);
+      if (!T.auto) return;
+      const timer = setInterval(() => {
+        if (status.isConnected) runTrades();
+        else {
+          clearInterval(timer); // this view is gone; a newer one schedules its own refresh
+          if (T.timer === timer) T.timer = null;
+        }
+      }, 60000);
+      T.timer = timer;
     }
     runTrades();
     scheduleAuto();
@@ -850,115 +946,149 @@
     const W = S.wallet;
     const fromRoute = S.route.parts[1];
     if (fromRoute && /^0x[0-9a-fA-F]{40}$/.test(fromRoute) && fromRoute.toLowerCase() !== (W.addr || "").toLowerCase()) { W.addr = fromRoute; W.results = null; }
-    const input = h("input", { type: "text", class: "search mono", placeholder: t("wallet.placeholder"), value: W.addr, "aria-label": t("wallet.placeholder"), spellcheck: "false" });
+    const input = h("input", { type: "text", class: "search mono", placeholder: t("wallet.placeholder"), value: W.addr, "aria-label": t("wallet.placeholder"), spellcheck: "false", autocomplete: "off" });
     const btn = h("button", { type: "button", class: "btn primary", onclick: () => submit() }, t("wallet.lookup"));
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
     main.appendChild(h("div", { class: "page-head" }, h("div", null, h("h1", null, t("wallet.title")), h("p", { class: "hint" }, t("wallet.hint")))));
     main.appendChild(h("div", { class: "lookup" }, input, btn));
-    const status = h("p", { class: "count" });
+    const status = h("p", { class: "count", "aria-live": "polite" });
     const out = h("div");
     main.appendChild(status);
     main.appendChild(out);
+
     function submit() {
       const v = input.value.trim();
       if (!/^0x[0-9a-fA-F]{40}$/.test(v)) { status.textContent = t("wallet.invalid"); return; }
-      W.addr = v;
+      if (location.hash !== "#/wallet/" + v) { location.hash = "#/wallet/" + v; return; } // the route change runs the lookup
       W.results = null;
-      if (location.hash !== "#/wallet/" + v) { location.hash = "#/wallet/" + v; return; }
       run();
     }
+    /** The explorer scans forward from here: the block of the chain's first Metric pool. */
+    function firstPoolBlock(chainId) {
+      const blocks = pools().concat(emptyPools()).filter((p) => p.chainId === chainId && p.createdBlock > 0).map((p) => p.createdBlock);
+      return blocks.length ? Math.min(...blocks) : 0;
+    }
+    /** Positions (Metric API) and swap history (explorers) of one address. Never rejects: failures are listed in the result. */
+    function lookup(addr) {
+      if (W.pending && W.pending.addr === addr) return W.pending.promise; // a redraw joins the lookup already in flight
+      const promise = (async () => {
+        const res = { addr, positions: [], posFailed: [], swaps: [], swapNotes: [] };
+        await Promise.all(CHAIN_IDS.map(async (id) => {
+          try {
+            res.positions.push(...(await MR.walletPositions(id, addr, findPool)));
+          } catch (e) {
+            res.posFailed.push(id);
+          }
+        }).concat(CHAIN_IDS.map(async (id) => {
+          try {
+            const r = await MR.walletSwaps(id, addr, findPool, firstPoolBlock(id));
+            if (!r.supported) res.swapNotes.push({ id, kind: "unsupported" });
+            else {
+              res.swaps.push(...r.swaps);
+              if (!r.complete) res.swapNotes.push({ id, kind: "partial" });
+            }
+          } catch (e) {
+            res.swapNotes.push({ id, kind: e.rateLimited ? "limited" : "failed" });
+          }
+        })));
+        res.positions.sort((a, b) => (b.value || 0) - (a.value || 0));
+        if (W.pending && W.pending.promise === promise) W.pending = null;
+        return res;
+      })();
+      W.pending = { addr, promise };
+      return promise;
+    }
     async function run() {
-      if (W.loading) return;
-      W.loading = true;
+      const addr = W.addr;
       btn.disabled = true;
       status.textContent = t("wallet.scanning") + "…";
       out.innerHTML = "";
-      const ps = pools();
-      const res = [];
-      const errs = [];
-      await Promise.all(CHAIN_IDS.map(async (id) => {
-        const cp = ps.filter((p) => p.chainId === id);
-        if (!cp.length) return;
-        try {
-          const r = await MR.scanWallet(id, W.addr, cp, { onProgress: (pr) => { status.textContent = t("wallet.scanning") + "… " + chainName(id) + (pr.stage === "reads" ? " (" + pr.positions + ")" : ""); } });
-          res.push(r);
-        } catch (e) {
-          errs.push({ id, e });
-        }
-      }));
-      W.loading = false;
+      const res = await lookup(addr);
+      if (!out.isConnected) return; // this view was replaced; its successor awaits the same lookup
       btn.disabled = false;
-      W.results = { res, errs, at: Date.now() };
-      if (!main.isConnected) return;
+      W.results = res;
       drawWallet();
     }
     function drawWallet() {
-      const { res, errs } = W.results;
+      const { positions, posFailed, swaps: rawSwaps, swapNotes } = W.results;
+      const swaps = [...rawSwaps].sort((a, b) => (b.ts || 0) - (a.ts || 0));
       out.innerHTML = "";
-      status.textContent = errs.length ? errs.map((x) => t("wallet.rpcFail", { chain: chainName(x.id) })).join(" ") + " " + t("wallet.partial") : "";
-      const positions = res.flatMap((r) => r.positions);
-      const swaps = res.flatMap((r) => r.swaps.map((s) => ({ ...s, chainId: r.chainId }))).sort((a, b) => b.block - a.block);
-      const closed = sum(res, (r) => r.closed);
+      status.textContent = posFailed.map((id) => t("wallet.posFail", { chain: chainName(id) })).join(" ");
+      const known = posFailed.length < CHAIN_IDS.length; // at least one chain answered
       const totalValue = sum(positions, (p) => p.value);
+      const fees = sum(positions, (p) => p.feesEarned);
+      const weighted = positions.filter((p) => p.value > 0 && p.periods["7d"].feeApr != null);
+      const apr7 = weighted.length ? sum(weighted, (p) => p.value * p.periods["7d"].feeApr) / sum(weighted, (p) => p.value) : null;
       const swapVol = sum(swaps, (s) => s.usd);
-      const chainsActive = new Set([...positions.map((p) => p.chainId), ...swaps.map((s) => s.chainId)]);
-      const firstTs = positions.map((p) => p.firstTs).concat(swaps.map((s) => s.ts)).filter(Boolean).sort((a, b) => a - b)[0] || null;
-      const lastTs = swaps.map((s) => s.ts).concat(positions.map((p) => p.firstTs)).filter(Boolean).sort((a, b) => b - a)[0] || null;
-      const shareTxt = t("wallet.shareText", { swaps: fmtInt(swaps.length), vol: fmtUsd(swapVol), positions: fmtInt(positions.length), value: fmtUsd(totalValue) });
+      const swapChains = CHAIN_IDS.filter((id) => !swapNotes.some((n) => n.id === id && n.kind !== "partial")).map((id) => CONFIG.chains[id].short).join(" + ");
       out.appendChild(h("div", { class: "tiles" },
-        statTile(t("wallet.summary.value"), fmtUsd(totalValue)),
-        statTile(t("wallet.summary.positions"), fmtInt(positions.length), closed ? t("wallet.closed", { n: closed }) : null),
-        statTile(t("wallet.summary.swapVol"), fmtUsd(swapVol)),
-        statTile(t("wallet.summary.swapCount"), fmtInt(swaps.length)),
-        statTile(t("wallet.summary.chains"), fmtInt(chainsActive.size)),
-        statTile(t("wallet.summary.firstSeen"), firstTs ? fmtDate(firstTs) : t("common.na"), lastTs ? t("wallet.summary.lastSeen") + " " + fmtDate(lastTs, true) : null)
+        statTile(t("wallet.summary.value"), known ? fmtUsd(totalValue) : t("common.na")),
+        statTile(t("wallet.summary.positions"), known ? fmtInt(positions.length) : t("common.na"), positions.length ? t("wallet.summary.chains", { n: new Set(positions.map((p) => p.chainId)).size }) : null),
+        statTile(t("wallet.summary.fees"), known ? fmtUsd(fees) : t("common.na")),
+        statTile(t("wallet.summary.apr7"), apr7 != null ? fmtPct(apr7, 1) : t("common.na")),
+        statTile(t("wallet.summary.swapVol"), swapChains ? fmtUsd(swapVol) : t("common.na"), swapChains || null),
+        statTile(t("wallet.summary.swapCount"), swapChains ? fmtInt(swaps.length) : t("common.na"), swaps.length ? t("wallet.summary.lastSwap") + " " + fmtDate(swaps[0].ts, true) : null)
       ));
-      out.appendChild(h("div", { class: "card-foot" }, linkBtn(t("wallet.share"), xShare(shareTxt, location.href), "ghost")));
+      const shareTxt = t("wallet.shareText", { swaps: fmtInt(swaps.length), vol: fmtUsd(swapVol), positions: fmtInt(positions.length), value: fmtUsd(totalValue) });
+      out.appendChild(h("div", { class: "card-foot" }, linkBtn(t("wallet.share"), xShare(shareTxt, location.href), "ghost"), linkBtn(t("wallet.openPortfolio"), "https://app.metric.xyz/portfolio", "ghost")));
+
       // positions
       const posEl = h("div", { class: "positions" });
-      if (!positions.length) posEl.appendChild(empty(t("wallet.noPositions")));
+      if (!positions.length) posEl.appendChild(empty(posFailed.length === CHAIN_IDS.length ? t("wallet.posUnavailable") : t("wallet.noPositions")));
       positions.forEach((pos) => posEl.appendChild(positionCard(pos)));
-      out.appendChild(section(t("wallet.positions"), null, posEl));
-      // points placeholder
+      out.appendChild(section(t("wallet.positions"), t("wallet.positionsHint"), posEl));
       out.appendChild(section(t("wallet.points"), null, h("p", { class: "hint" }, t("wallet.pointsNote"))));
+
       // swaps
-      const g = h("div", { class: "grid-2" });
-      const byChain = CHAIN_IDS.map((id) => ({ label: chainName(id), value: sum(swaps.filter((s) => s.chainId === id), (s) => s.usd), color: SERIES[id], sub: swaps.filter((s) => s.chainId === id).length + " swap" })).filter((r) => r.value > 0);
-      const bc = h("div");
-      MR.barRows(bc, byChain, fmtUsd);
-      const agg = new Map();
-      swaps.forEach((s) => { const k = s.chainId + ":" + s.pool; const a = agg.get(k) || { label: s.pair || short(s.pool), chainId: s.chainId, pool: s.pool, usd: 0, n: 0 }; a.usd += s.usd || 0; a.n++; agg.set(k, a); });
-      const bp = h("div");
-      MR.barRows(bp, [...agg.values()].sort((a, b) => b.usd - a.usd).slice(0, 10).map((a) => ({ label: a.label, sub: chainName(a.chainId) + " · " + a.n, value: a.usd, color: SERIES[a.chainId], href: "#/pool/" + a.chainId + "/" + a.pool })), fmtUsd);
-      g.appendChild(section(t("wallet.byChain"), null, byChain.length ? bc : empty(t("wallet.noSwaps"))));
-      g.appendChild(section(t("wallet.byPool"), null, agg.size ? bp : empty(t("wallet.noSwaps"))));
-      out.appendChild(g);
-      const swapTbl = swaps.length ? table([{ label: t("wallet.swapCols.time") }, { label: t("wallet.swapCols.chain") }, { label: t("wallet.swapCols.pool") }, { label: t("wallet.swapCols.side") }, { label: t("wallet.swapCols.in"), num: true }, { label: t("wallet.swapCols.out"), num: true }, { label: t("wallet.swapCols.usd"), num: true }, { label: t("wallet.swapCols.tx") }],
-        swaps.slice(0, 200).map((s) => h("tr", null, td(s.ts ? fmtDate(s.ts, true) : "#" + fmtInt(s.block), "num"), td(chainChip(s.chainId)), td(h("a", { href: "#/pool/" + s.chainId + "/" + s.pool }, s.pair || short(s.pool))), td(h("span", { class: "side " + s.side }, s.side === "sell" ? t("trades.sell") : t("trades.buy"))), td(s.tokIn ? fmtNum(s.amountIn) + " " + s.tokIn.sym : t("common.na"), "num"), td(s.tokOut ? fmtNum(s.amountOut) + " " + s.tokOut.sym : t("common.na"), "num"), td(fmtUsd(s.usd), "num"), td(h("a", { href: explorerTx(s.chainId, s.tx), target: "_blank", rel: "noopener" }, short(s.tx, 3))))),
-        { cls: "compact" }) : empty(t("wallet.noSwaps"));
-      out.appendChild(section(t("wallet.swaps"), null, swapTbl));
+      const swapSection = section(t("wallet.swaps"), t("wallet.swapScope"));
+      swapNotes.filter((n) => n.kind !== "unsupported").forEach((n) => swapSection.appendChild(note(t("wallet.swapNote." + n.kind, { chain: chainName(n.id) }))));
+      if (swaps.length) {
+        const byChain = CHAIN_IDS.map((id) => { const cs = swaps.filter((s) => s.chainId === id); return { label: chainName(id), value: sum(cs, (s) => s.usd), color: SERIES[id], sub: fmtInt(cs.length) + " swap" }; }).filter((r) => r.value > 0);
+        const agg = new Map();
+        swaps.forEach((s) => { const k = s.chainId + ":" + s.pool; const a = agg.get(k) || { label: s.pair, chainId: s.chainId, pool: s.pool, usd: 0, n: 0 }; a.usd += s.usd || 0; a.n++; agg.set(k, a); });
+        const bc = h("div");
+        const bp = h("div");
+        MR.barRows(bc, byChain, fmtUsd);
+        MR.barRows(bp, [...agg.values()].sort((a, b) => b.usd - a.usd).slice(0, 10).map((a) => ({ label: a.label, sub: chainName(a.chainId) + " · " + fmtInt(a.n), value: a.usd, color: SERIES[a.chainId], href: "#/pool/" + a.chainId + "/" + a.pool })), fmtUsd);
+        swapSection.appendChild(h("div", { class: "grid-2 plain" }, h("div", null, h("h3", null, t("wallet.byChain")), bc), h("div", null, h("h3", null, t("wallet.byPool")), bp)));
+        swapSection.appendChild(table([{ label: t("wallet.swapCols.time") }, { label: t("wallet.swapCols.chain") }, { label: t("wallet.swapCols.pool") }, { label: t("wallet.swapCols.side") }, { label: t("wallet.swapCols.in"), num: true }, { label: t("wallet.swapCols.out"), num: true }, { label: t("wallet.swapCols.usd"), num: true }, { label: t("wallet.swapCols.tx") }],
+          swaps.slice(0, 200).map((s) => h("tr", null, td(s.ts ? fmtDate(s.ts, true) : "#" + fmtInt(s.block), "num"), td(chainChip(s.chainId)), td(h("a", { href: "#/pool/" + s.chainId + "/" + s.pool }, s.pair)), td(sideCell(s)), td(fmtNum(s.amountIn) + " " + s.tokIn.sym, "num"), td(fmtNum(s.amountOut) + " " + s.tokOut.sym, "num"), td(fmtUsd(s.usd), "num"), td(h("a", { href: explorerTx(s.chainId, s.tx), target: "_blank", rel: "noopener" }, short(s.tx, 3))))),
+          { cls: "compact" }));
+      } else if (swapChains) swapSection.appendChild(empty(t("wallet.noSwaps")));
+      out.appendChild(swapSection);
     }
     function positionCard(pos) {
       const p = pos.pool;
       const st = pos.status;
       const stTxt = st === "in" ? t("wallet.pos.inRange") : st === "edge" ? t("wallet.pos.edge") : st === "out" ? t("wallet.pos.outRange") : t("common.na");
+      const stNote = st === "out" ? t("wallet.pos.outNote") : st === "edge" ? t("wallet.pos.edgeNote") : null;
       const lo = Math.min(...pos.bins), hi = Math.max(...pos.bins);
-      const card = h("div", { class: "pos-card" },
-        h("div", { class: "pos-head" }, h("a", { href: "#/pool/" + p.chainId + "/" + p.address }, pairCell(p)), chainChip(p.chainId), tierChip(p)),
+      const w7 = pos.periods["7d"];
+      const all = pos.periods.all;
+      const amount = (v, tok) => (v != null && tok ? fmtNum(v) + " " + tok.sym : t("common.na"));
+      const perfRows = PERIODS.map((w) => {
+        const x = pos.periods[w];
+        return h("tr", null, td(t("wallet.period." + w)), td(x.feeApr != null ? fmtPct(x.feeApr, 1) : t("common.na"), "num"), td(fmtUsd(x.feeIncome), "num"), td(fmtUsd(x.pnl), "num " + signCls(x.pnl)), td(fmtUsd(x.markout), "num " + signCls(x.markout)), td(fmtUsd(x.volume), "num"));
+      });
+      return h("div", { class: "pos-card" },
+        h("div", { class: "pos-head" }, p ? h("a", { href: "#/pool/" + p.chainId + "/" + p.address }, pairCell(p)) : h("span", { class: "mono" }, short(pos.poolAddress)), chainChip(pos.chainId), tierChip({ private: !!(p && p.private), tier: pos.tier })),
         h("div", { class: "pos-grid" },
           h("div", null, h("small", null, t("wallet.pos.value")), h("b", { class: "big" }, fmtUsd(pos.value))),
-          h("div", null, h("small", null, t("wallet.pos.amounts")), h("span", null, fmtNum(pos.amt0) + " " + p.t0.sym), h("br"), h("span", null, fmtNum(pos.amt1) + " " + p.t1.sym)),
-          h("div", null, h("small", null, t("wallet.pos.bins")), h("span", { class: "num" }, "#" + lo + (lo !== hi ? " … #" + hi : "") + " (" + pos.bins.length + ")"), h("br"), h("small", null, t("detail.activeBin") + " #" + (p.curBinIdx != null ? p.curBinIdx : "?"))),
-          h("div", null, h("small", null, t("wallet.pos.status")), h("span", { class: "chip st st-" + (st === "in" ? "healthy" : st === "edge" ? "unknown" : "feed_down") }, h("i", { class: "sw" }), stTxt)),
-          h("div", null, h("small", null, t("wallet.pos.feeApr")), h("span", null, fmtBps(p.apr7Bps))),
-          h("div", null, h("small", null, t("wallet.pos.deposited")), h("span", null, pos.firstTs ? fmtDate(pos.firstTs, true) : "#" + fmtInt(pos.firstBlock)))
+          h("div", null, h("small", null, t("wallet.pos.amounts")), h("span", null, amount(pos.amt0, p && p.t0)), h("br"), h("span", null, amount(pos.amt1, p && p.t1))),
+          h("div", null, h("small", null, t("wallet.pos.bins")), h("span", { class: "num" }, "#" + lo + (lo !== hi ? " … #" + hi : "") + " (" + pos.bins.length + ")"), h("small", { class: "under" }, t("detail.activeBin") + " #" + (p && p.curBinIdx != null ? p.curBinIdx : "?"))),
+          h("div", null, h("small", null, t("wallet.pos.status")), h("span", { class: "chip st st-" + (st === "in" ? "healthy" : st === "out" ? "feed_down" : st === "edge" ? "pool_paused" : "unknown") }, h("i", { class: "sw" }), stTxt), stNote ? h("small", { class: "under" }, stNote) : null),
+          h("div", null, h("small", null, t("wallet.pos.feeApr")), h("span", null, w7.feeApr != null ? fmtPct(w7.feeApr, 1) : t("common.na"))),
+          h("div", null, h("small", null, t("wallet.pos.fees")), h("span", null, fmtUsd(pos.feesEarned)), pos.fees24 != null ? h("small", { class: "under" }, t("wallet.pos.fees24") + " " + fmtUsd(pos.fees24)) : null),
+          h("div", null, h("small", null, t("wallet.pos.pnl")), h("span", { class: signCls(all.pnl) }, fmtUsd(all.pnl))),
+          h("div", null, h("small", null, t("wallet.pos.opened")), h("span", null, fmtDate(pos.openedAt || pos.lastDeposit, true)))
         ),
-        h("p", { class: "sub mono" }, t("wallet.pos.salt") + " " + pos.salt + " · " + t("wallet.add") + " " + pos.adds + " · " + t("wallet.remove") + " " + pos.removes)
+        h("details", { class: "pos-more" }, h("summary", null, t("wallet.pos.performance")),
+          table([{ label: t("detail.window") }, { label: t("wallet.pos.feeAprCol"), num: true }, { label: t("wallet.pos.feeIncome"), num: true }, { label: t("wallet.pos.pnl"), num: true }, { label: t("wallet.pos.markout"), num: true }, { label: t("wallet.pos.volume"), num: true }], perfRows, { cls: "compact" })),
+        h("p", { class: "sub mono" }, t("wallet.pos.salt") + " " + pos.salt)
       );
-      return card;
     }
     if (W.addr && /^0x[0-9a-fA-F]{40}$/.test(W.addr)) {
-      if (W.results) drawWallet();
+      if (W.results && W.results.addr === W.addr) drawWallet();
       else run();
     }
   }
@@ -985,38 +1115,50 @@
     const cur = MR.settings.get();
     dlg.innerHTML = "";
     const api = h("input", { type: "url", value: cur.apiBase || CONFIG.apiBase, class: "search mono" });
-    const rpcs = CHAIN_IDS.map((id) => ({ id, el: h("input", { type: "text", class: "search mono", value: (cur.rpc && cur.rpc[id] ? cur.rpc[id] : MR.rpc.list(id)).join(", ") }) }));
+    const rpcs = CHAIN_IDS.map((id) => ({ id, el: h("input", { type: "text", class: "search mono", value: ((cur.rpc && cur.rpc[id]) || []).join(", "), placeholder: MR.logEndpoints(id).map((e) => e.url).join(", ") }) }));
     const form = h("form", { method: "dialog", class: "settings" },
       h("h2", null, t("common.settings")),
       h("label", null, h("span", null, t("common.settingsApi")), api, h("small", null, t("common.settingsApiHint"))),
+      h("p", { class: "sub" }, t("common.settingsRpcHint")),
       ...rpcs.map((r) => h("label", null, h("span", null, t("common.settingsRpc") + " · " + chainName(r.id)), r.el)),
       h("div", { class: "actions" },
         h("button", { type: "button", class: "btn ghost", onclick: () => { MR.settings.set({}); location.reload(); } }, t("common.reset")),
         h("button", { type: "button", class: "btn ghost", onclick: () => dlg.close() }, t("common.close")),
-        h("button", { type: "submit", class: "btn primary", onclick: (e) => { e.preventDefault(); const s = { apiBase: api.value.trim(), rpc: {} }; rpcs.forEach((r) => { s.rpc[r.id] = r.el.value.split(",").map((x) => x.trim()).filter(Boolean); }); MR.settings.set(s); location.reload(); } }, t("common.save")))
+        h("button", { type: "submit", class: "btn primary", onclick: (e) => {
+          e.preventDefault();
+          const s = { rpc: {} };
+          const base = api.value.trim().replace(/\/+$/, "");
+          if (base && base !== MR.config.apiBase) s.apiBase = base; // keep following the default unless it was changed
+          else if (cur.apiBase) s.apiBase = cur.apiBase;
+          rpcs.forEach((r) => { const list = r.el.value.split(",").map((x) => x.trim()).filter(Boolean); if (list.length) s.rpc[r.id] = list; });
+          MR.settings.set(s);
+          location.reload();
+        } }, t("common.save")))
     );
     dlg.appendChild(form);
     dlg.showModal();
   }
 
   // ---------- render ----------
-  function render() {
+  function render(opts) {
     S.route = parseRoute();
     renderShell();
     const main = $("#main");
+    const y = window.scrollY;
     main.innerHTML = "";
-    window.scrollTo(0, 0);
     if (!S.data) {
       main.appendChild(h("div", { class: "loading" }, h("div", { class: "spinner" }), h("p", null, t("common.loading") + "…")));
       return;
     }
-    if (S.status.source === "error" && !pools().length) {
+    if (S.status.source === "error" && !pools().length && S.route.name !== "guide") {
       main.appendChild(h("div", { class: "loading" }, h("p", null, t("source.error")), h("p", { class: "hint" }, S.status.error || ""), h("button", { type: "button", class: "btn primary", onclick: () => location.reload() }, t("common.retry"))));
-      if (S.route.name !== "guide") return;
+      return;
     }
     const v = { overview: viewOverview, pools: viewPools, pool: viewPool, trades: viewTrades, wallet: viewWallet, guide: viewGuide }[S.route.name] || viewOverview;
     v(main);
-    document.title = (S.route.name === "pool" ? (poolByKey(S.route.parts[1], S.route.parts[2] || "") || { pair: "" }).pair + " · " : S.route.name !== "overview" ? t("nav." + S.route.name) + " · " : "") + t("appName");
+    window.scrollTo(0, opts && opts.keepScroll ? y : 0);
+    const titled = S.route.name === "pool" ? findPool(S.route.parts[1], S.route.parts[2] || "") : null;
+    document.title = (titled ? titled.pair + " · " : S.route.name !== "overview" && S.route.name !== "pool" ? t("nav." + S.route.name) + " · " : "") + t("appName");
   }
 
   // ---------- boot ----------
@@ -1025,15 +1167,33 @@
     try { S.theme = localStorage.getItem("mr.theme") || (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"); } catch (e) { S.theme = "dark"; }
     applyTheme();
     document.documentElement.lang = S.lang;
-    $("#langBtn").addEventListener("click", () => { S.lang = S.lang === "tr" ? "en" : "tr"; try { localStorage.setItem("mr.lang", S.lang); } catch (e) { /* ignore */ } document.documentElement.lang = S.lang; render(); });
-    $("#themeBtn").addEventListener("click", () => { S.theme = S.theme === "dark" ? "light" : "dark"; try { localStorage.setItem("mr.theme", S.theme); } catch (e) { /* ignore */ } applyTheme(); render(); });
+    $("#langBtn").addEventListener("click", () => { S.lang = S.lang === "tr" ? "en" : "tr"; try { localStorage.setItem("mr.lang", S.lang); } catch (e) { /* ignore */ } document.documentElement.lang = S.lang; render({ keepScroll: true }); });
+    $("#themeBtn").addEventListener("click", () => { S.theme = S.theme === "dark" ? "light" : "dark"; try { localStorage.setItem("mr.theme", S.theme); } catch (e) { /* ignore */ } applyTheme(); render({ keepScroll: true }); });
     $("#settingsBtn").addEventListener("click", openSettings);
     render();
-    const data = await MR.loadDataset((st) => { S.status = st; renderSource(); });
-    S.data = data;
-    S.status = data.status;
-    if (data.status.source === "snapshot" && data.status.error) console.warn("Metric Radar: live API failed, using snapshot:", data.status.error);
-    render();
+
+    // 1) the hourly snapshot paints the page at once; 2) the API then brings the funded pools up to the minute
+    const snap = await MR.loadSnapshot();
+    const hadSnapshot = snap.pools.length > 0;
+    if (hadSnapshot) {
+      S.data = snap;
+      S.status = { source: "snapshot", generatedAt: snap.generatedAt, api: "pending" };
+      render();
+    }
+    try {
+      S.data = await MR.refreshLive(S.data || snap);
+      S.status = { source: "live", generatedAt: snap.generatedAt, api: "ok" };
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      console.warn("Metric Radar: live API failed" + (hadSnapshot ? ", showing the snapshot" : "") + ":", msg);
+      if (!S.data) S.data = snap;
+      S.status = hadSnapshot ? { source: "snapshot", generatedAt: snap.generatedAt, api: "down", error: msg } : { source: "error", api: "down", error: msg + (snap.error ? " · snapshot: " + snap.error : "") };
+    }
+    // Fresh numbers matter on the overview and the pool list. Elsewhere a re-render would only interrupt
+    // (a lookup in progress, a form being typed in), so those views pick the new data up on the next navigation.
+    const focused = document.activeElement && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
+    if (!hadSnapshot || ((S.route.name === "overview" || S.route.name === "pools") && !focused)) render({ keepScroll: true });
+    else renderSource();
   }
   document.addEventListener("DOMContentLoaded", boot);
 })();

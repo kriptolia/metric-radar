@@ -2,14 +2,16 @@
 """Metric Radar snapshot.
 
 Fetches every pool on Metric's public chains from the keyless public API, writes:
-  data/latest.json   - the normalized pool list the site falls back to when the live API is unreachable
+  data/latest.json   - what the site renders first: full records of the active pools ("pools"), slim records of
+                       the empty ones ("index", needed to attribute wallet activity), shared addresses ("chainMeta")
   data/history.json  - rolling time series: hourly + daily per chain, daily per pool
 
-Run hourly by GitHub Actions (.github/workflows/snapshot.yml). Standard library only.
-Field shapes mirror normalizePool() in assets/data.js: keep the two in sync.
+Run hourly by GitHub Actions (.github/workflows/snapshot.yml), which publishes both files to the `data` branch.
+Standard library only. Field shapes mirror normalizePool() in assets/data.js: keep the two in sync.
 """
 from __future__ import annotations
 
+import collections
 import datetime as dt
 import json
 import os
@@ -26,6 +28,9 @@ PUBLIC_CHAINS = [1, 56, 4663]
 HOURLY_KEEP = 24 * 60  # 60 days of hourly points per chain
 DAILY_KEEP = 400
 POOL_DAILY_KEEP = 120
+ACTIVE_MIN_TVL = 1.0  # below this a pool counts as empty
+POOL_HISTORY_MIN_TVL = 1000.0  # per-pool series are kept for pools at or above this
+SHARED_FIELDS = ("dataProvider", "quoter", "factory")  # identical for (nearly) every pool of a chain
 
 
 def get(path: str, retries: int = 3) -> dict:
@@ -159,16 +164,75 @@ def fetch_pools(chain_ids: list[int]) -> list[dict]:
                 out.append(normalize(raw))
             offset = r.get("nextOffset")
             pages += 1
-        print(f"chain {cid}: {sum(1 for p in out if p['chainId'] == cid)} pools", file=sys.stderr)
+        count = sum(1 for p in out if p["chainId"] == cid)
+        print(f"chain {cid}: {count} pools", file=sys.stderr)
+        if not count:
+            # an outage that answers with an empty list must not be recorded as "this chain has no pools"
+            raise RuntimeError(f"chain {cid} returned no pools; keeping the previous snapshot")
     return out
 
 
-def load_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return default
+def is_active(p: dict) -> bool:
+    """Funded, or traded recently: these get a full record. Most pools ever created are empty shells."""
+    return (p.get("tvl") or 0) >= ACTIVE_MIN_TVL or (p.get("vol7") or 0) > 0 or (p.get("swaps24") or 0) > 0
+
+
+def chain_meta(pools: list[dict]) -> dict:
+    """Most common helper-contract addresses per chain, so pool records only carry the exceptions."""
+    meta = {}
+    for cid in sorted({p["chainId"] for p in pools}):
+        entry = {}
+        for field in SHARED_FIELDS:
+            counts = collections.Counter(p[field] for p in pools if p["chainId"] == cid and p.get(field))
+            entry[field] = counts.most_common(1)[0][0] if counts else None
+        meta[str(cid)] = entry
+    return meta
+
+
+def without_shared(p: dict, meta: dict) -> dict:
+    shared = meta.get(str(p["chainId"])) or {}
+    return {k: v for k, v in p.items() if not (k in SHARED_FIELDS and v == shared.get(k))}
+
+
+def slim(p: dict, meta: dict) -> dict:
+    """What the site needs from an empty pool: identity, decimals/prices to value a wallet's activity, and totals."""
+
+    def tok(t):
+        return {"addr": t["addr"], "sym": t["sym"], "dec": t["dec"], "price": t["price"]}
+
+    out = {
+        "chainId": p["chainId"],
+        "address": p["address"],
+        "pair": p["pair"],
+        "t0": tok(p["t0"]),
+        "t1": tok(p["t1"]),
+        "tvl": p["tvl"],
+        "tier": p["tier"],
+        "private": p["private"],
+        "verifiedAdmin": p["verifiedAdmin"],
+        "ppStatus": p["ppStatus"],
+        "curBinIdx": p["curBinIdx"],
+        "created": p["created"],
+        "createdBlock": p["createdBlock"],
+        "vol30": p["vol30"],
+        "volAll": p["volAll"],
+    }
+    shared = meta.get(str(p["chainId"])) or {}
+    for field in SHARED_FIELDS:
+        if p.get(field) and p[field] != shared.get(field):
+            out[field] = p[field]
+    return out
+
+
+def load_history(path) -> dict:
+    """A missing file starts a new history; an unreadable one aborts the run instead of silently replacing months of data."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        history = json.load(f)
+    if not isinstance(history, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    return history
 
 
 def dump_json(path, obj):
@@ -189,7 +253,8 @@ def roll_history(history: dict, pools: list[dict], now: int) -> dict:
     live = [p for p in pools if p.get("tier") != "black"]
     for cid in sorted({p["chainId"] for p in live}):
         cp = [p for p in live if p["chainId"] == cid]
-        point = [now, r2(sum(p["tvl"] or 0 for p in cp)), r2(sum(p["vol24"] or 0 for p in cp)), len(cp), sum(p["swaps24"] or 0 for p in cp)]
+        funded = sum(1 for p in cp if (p["tvl"] or 0) >= ACTIVE_MIN_TVL)
+        point = [now, r2(sum(p["tvl"] or 0 for p in cp)), r2(sum(p["vol24"] or 0 for p in cp)), funded, sum(p["swaps24"] or 0 for p in cp)]
         key = str(cid)
         series = hourly.setdefault(key, [])
         series.append(point)
@@ -201,6 +266,8 @@ def roll_history(history: dict, pools: list[dict], now: int) -> dict:
             d.append(point)
         del d[:-DAILY_KEEP]
     for p in live:
+        if (p["tvl"] or 0) < POOL_HISTORY_MIN_TVL:
+            continue
         key = f"{p['chainId']}:{p['address'].lower()}"
         mk = ((p.get("markout") or {}).get("7d") or {}).get("5m") or {}
         point = [now, p["tvl"], p["vol24"], p["apr7Bps"], mk.get("aprBps"), p["swaps24"]]
@@ -227,12 +294,14 @@ def main() -> int:
         print("no pools fetched; keeping previous files", file=sys.stderr)
         return 1
     os.makedirs(DATA, exist_ok=True)
-    latest = {"generatedAt": now, "chains": chain_ids, "pools": pools, "source": API}
+    history = roll_history(load_history(os.path.join(DATA, "history.json")), pools, now)
+    meta = chain_meta(pools)
+    active = [without_shared(p, meta) for p in pools if is_active(p)]
+    index = [slim(p, meta) for p in pools if not is_active(p)]
+    latest = {"v": 2, "generatedAt": now, "chains": chain_ids, "chainMeta": meta, "pools": active, "index": index, "source": API}
     dump_json(os.path.join(DATA, "latest.json"), latest)
-    history = load_json(os.path.join(DATA, "history.json"), {})
-    history = roll_history(history, pools, now)
     dump_json(os.path.join(DATA, "history.json"), history)
-    print(f"ok: {len(pools)} pools, generatedAt={now}", file=sys.stderr)
+    print(f"ok: {len(active)} active + {len(index)} empty pools, generatedAt={now}", file=sys.stderr)
     return 0
 
 

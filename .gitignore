@@ -2,3 +2,5 @@
 .DS_Store
 __pycache__/
 node_modules/
+# written by scripts/snapshot.py; published to the `data` branch by the workflow, never committed to main
+/data/

@@ -18,6 +18,10 @@
       //         about 150 requests a minute per visitor. Used for a wallet's swap history.
       // logsApi: the same explorer's Etherscan-compatible log API. Topic-only queries, but about 10 requests per hour
       //         per visitor, and on Robinhood Chain it only reaches back about a week: a supplement, never the source.
+      // ledgerApi: for a chain without such an explorer, 3xpl's public sandbox. It lists an address's balance events,
+      //         1,000 a request, about one request a second per visitor; keyless, with no uptime promise.
+      // receiptRpc: endpoints that answer eth_getTransactionReceipt for old transactions, in JSON-RPC batches
+      //         (BNB Chain's log endpoint only keeps recent blocks).
       1: {
         name: "Ethereum", short: "ETH", blockTime: 12, explorer: "https://etherscan.io",
         explorerApi: "https://eth.blockscout.com/api/v2",
@@ -29,8 +33,11 @@
       },
       56: {
         name: "BNB Chain", short: "BNB", blockTime: 0.45, explorer: "https://bscscan.com",
-        explorerApi: null, // no keyless indexed explorer for BNB Chain
+        explorerApi: null, // no keyless Blockscout for BNB Chain
         logsApi: null,
+        ledgerApi: "https://sandbox-api.3xpl.com/bnb",
+        ledgerModule: "bnb-main",
+        receiptRpc: ["https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed1.binance.org", "https://api.zan.top/bsc-mainnet"],
         logRpc: [{ url: "https://bsc-rpc.publicnode.com", maxAddrs: 10, maxRange: 5000 }],
       },
       4663: {
@@ -79,6 +86,8 @@
       c.logRpc = [{ url: location.origin + "/rpc/" + id, maxAddrs: 4, maxRange: 20000 }];
       c.logsApi = c.logsApi ? location.origin + "/explorer/" + id + "/api" : null;
       c.explorerApi = c.explorerApi ? location.origin + "/explorer/" + id + "/api/v2" : null;
+      if (c.ledgerApi) c.ledgerApi = location.origin + "/ledger/" + id;
+      if (c.receiptRpc) c.receiptRpc = [location.origin + "/rpc/" + id];
     } else {
       // v1 saved its whole default list here; those entries either refuse browsers or do not serve logs
       const dead = /rpc\.metric\.xyz|llamarpc\.com|bsc-dataseed/;
@@ -753,7 +762,88 @@
     if (lastErr) throw lastErr;
     return null;
   }
-  const WALLET_TX_PAGES = 8; // 400 transactions since Metric's launch on the chain
+  /**
+   * The transactions an address sent, out of one page of a 3xpl ledger listing (balance events, newest first).
+   * The sender is the address charged the fee: its fee event has extra "f" and a negative effect ("-0" when the gas
+   * price was zero). A reverted transaction keeps its fee event and marks its value event as failed.
+   * Returns { txs: [{ hash, ts, block }], reachedSince }; reachedSince is true once an event is older than sinceBlock.
+   */
+  function ledgerSent(events, sinceBlock) {
+    const sent = new Map();
+    const failed = new Set();
+    let reachedSince = false;
+    for (const ev of events || []) {
+      if (!ev || !ev.transaction) continue;
+      if (ev.block != null && ev.block < sinceBlock) {
+        reachedSince = true;
+        continue;
+      }
+      if (ev.failed) failed.add(ev.transaction);
+      if (ev.extra === "f" && String(ev.effect).charAt(0) === "-" && !sent.has(ev.transaction)) sent.set(ev.transaction, { hash: ev.transaction, ts: Date.parse(ev.time) / 1000, block: ev.block });
+    }
+    return { txs: [...sent.values()].filter((x) => !failed.has(x.hash)), reachedSince };
+  }
+  MR.ledgerSent = ledgerSent;
+  const LEDGER_PAGE = 1000; // events a request: the API accepts 1, 10, 100 or 1000
+  /**
+   * Transactions an address sent since `sinceBlock`, newest first, from the chain's ledger API.
+   * Returns { txs: [{ hash, ts, block }], complete }; complete is false when the page budget ran out first.
+   */
+  async function ledgerTransactions(chainId, wallet, sinceBlock, maxPages) {
+    const cfg = CONFIG.chains[chainId];
+    const txs = [];
+    const seen = new Set();
+    for (let page = 0; page < maxPages; page++) {
+      if (page) await sleep(1100); // back-to-back requests are refused
+      // pages count from the newest event: -0 is the latest thousand, -1 the thousand before it
+      const url = cfg.ledgerApi + "/address/" + wallet.toLowerCase() + "?data=events&from=" + cfg.ledgerModule + "&limit=" + LEDGER_PAGE + "&page=-" + page;
+      let r;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          r = await fetchJson(url, {}, 30000);
+          break;
+        } catch (e) {
+          if (e.status === 429) e.rateLimited = true;
+          if (attempt >= 2) throw e;
+          await sleep(e.rateLimited ? 1600 : 900);
+        }
+      }
+      const events = (r && r.data && r.data.events && r.data.events[cfg.ledgerModule]) || [];
+      const part = ledgerSent(events, sinceBlock);
+      for (const x of part.txs) {
+        if (!seen.has(x.hash)) {
+          seen.add(x.hash);
+          txs.push(x);
+        }
+      }
+      if (part.reachedSince || events.length < LEDGER_PAGE) return { txs, complete: true };
+    }
+    return { txs, complete: false };
+  }
+  /**
+   * Receipts of `hashes` in one JSON-RPC batch per endpoint; hashes an endpoint has no receipt for go to the next one.
+   * Returns a Map hash → receipt; a hash no endpoint answered for is absent.
+   */
+  async function receiptBatch(chainId, hashes) {
+    const out = new Map();
+    let left = hashes.slice();
+    for (const url of CONFIG.chains[chainId].receiptRpc) {
+      if (!left.length) break;
+      const asked = left;
+      try {
+        const res = await fetchJson(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(asked.map((h, i) => ({ jsonrpc: "2.0", id: i, method: "eth_getTransactionReceipt", params: [h] }))) }, 25000);
+        if (!Array.isArray(res)) continue; // an endpoint that refuses batches answers with a single error object
+        for (const x of res) if (x && x.result && asked[x.id]) out.set(asked[x.id], x.result);
+        left = asked.filter((h) => !out.has(h));
+      } catch (e) {
+        /* the next endpoint gets the whole group */
+      }
+    }
+    return out;
+  }
+  const WALLET_TX_PAGES = 8; // explorer: 400 transactions since Metric's launch on the chain
+  const LEDGER_PAGES = 3; // ledger: 3,000 balance events, about 1,400 sent transactions
+  const RECEIPT_BATCH = 20;
   /**
    * Metric swaps made by a wallet on one chain.
    * since: { ts, block } of the chain's first Metric pool; nothing older can be a Metric swap.
@@ -761,18 +851,15 @@
    * The pool's Swap event names the contract that called it and the address the output went to. Wallets trade through
    * routers, so the output often goes to the router first (always when it is unwrapped to the native coin) and the
    * event never mentions the wallet. So the source of truth is the wallet's own transactions: every Swap event of a
-   * known pool inside a transaction the wallet sent is that wallet's swap.
+   * known pool inside a transaction the wallet sent is that wallet's swap. The list of those transactions comes from
+   * the chain's explorer, or from its ledger API where there is no such explorer.
    *
    * Returns { chainId, supported, swaps (newest first), complete, scanned }.
    */
   MR.walletSwaps = async function walletSwaps(chainId, wallet, findPool, since) {
     const cfg = CONFIG.chains[chainId];
-    if (!cfg.explorerApi) return { chainId, supported: false, swaps: [], complete: true, scanned: 0 };
+    if (!cfg.explorerApi && !cfg.ledgerApi) return { chainId, supported: false, swaps: [], complete: true, scanned: 0 };
     const from = since || { ts: 0, block: 0 };
-    const list = await walletTransactions(chainId, wallet, from.ts || 0, WALLET_TX_PAGES);
-    // A swap always moves tokens, a failed transaction emits no events, and a plain token send cannot contain a swap:
-    // only the remaining receipts are worth reading.
-    const candidates = list.txs.filter((x) => x.status === "ok" && x.method !== "transfer" && (x.transaction_types || x.tx_types || []).includes("token_transfer"));
     const found = new Map();
     const add = (log, pool, ts) => {
       const s = decodeSwapLog(log);
@@ -781,20 +868,38 @@
       const k = s.tx + ":" + s.logIndex;
       if (!found.has(k)) found.set(k, describeSwap(s, pool));
     };
-    let unread = 0;
-    await mapLimit(candidates, 10, async (x) => {
-      let rc;
-      try {
-        rc = await receipt(chainId, x.hash);
-      } catch (e) {
-        unread++;
-        return;
-      }
+    const readReceipt = (rc, ts) => {
       for (const l of (rc && rc.logs) || []) {
         const pool = findPool(chainId, l.address);
-        if (pool) add(l, pool, Date.parse(x.timestamp) / 1000);
+        if (pool) add(l, pool, ts);
       }
-    });
+    };
+    let unread = 0;
+    let list;
+    if (cfg.explorerApi) {
+      list = await walletTransactions(chainId, wallet, from.ts || 0, WALLET_TX_PAGES);
+      // A swap always moves tokens, a failed transaction emits no events, and a plain token send cannot contain a
+      // swap: only the remaining receipts are worth reading.
+      const candidates = list.txs.filter((x) => x.status === "ok" && x.method !== "transfer" && (x.transaction_types || x.tx_types || []).includes("token_transfer"));
+      await mapLimit(candidates, 10, async (x) => {
+        try {
+          readReceipt(await receipt(chainId, x.hash), Date.parse(x.timestamp) / 1000);
+        } catch (e) {
+          unread++;
+        }
+      });
+    } else {
+      // The ledger says who sent a transaction but not what it did, so every receipt is read, twenty to a request.
+      list = await ledgerTransactions(chainId, wallet, from.block || 0, LEDGER_PAGES);
+      await mapLimit(chunk(list.txs, RECEIPT_BATCH), 3, async (group) => {
+        const got = await receiptBatch(chainId, group.map((x) => x.hash));
+        for (const x of group) {
+          const rc = got.get(x.hash);
+          if (rc) readReceipt(rc, x.ts);
+          else unread++;
+        }
+      });
+    }
     // Supplement: swaps delivered to the address by somebody else's transaction (smart accounts, relayers).
     // The log API is tightly rationed, so a refusal here is not an error.
     if (cfg.logsApi) {

@@ -11,22 +11,26 @@ Mock endpoints, with the response shapes of the real services:
   /public/v1/evm/{chain}/{pool}/analytics/bins
   /public/v1/evm/{chain}/{pool}/activity          a pool's latest swaps
   /public/v1/evm/{chain}/positions/{wallet}       open LP positions with performance (demo wallet only)
-  /rpc/{chain}                                    JSON-RPC: eth_getBlockByNumber, eth_getTransactionReceipt, eth_getLogs
-                                                  (logs: rejects more than 4 addresses or 20,000 blocks)
+  /rpc/{chain}                                    JSON-RPC, single or batched: eth_getBlockByNumber, eth_getTransactionReceipt,
+                                                  eth_getLogs (logs: rejects more than 4 addresses or 20,000 blocks)
   /explorer/{chain}/api/v2/addresses/{a}/transactions   the transactions an address sent, 50 a page (demo wallet only)
   /explorer/{chain}/api?module=logs&action=getLogs  Etherscan-style logs (swaps whose output went straight to the demo wallet)
+  /ledger/{chain}/address/{a}?data=events&from=…  3xpl-style balance events, 1,000 a page, newest first (demo wallet only);
+                                                  like the real sandbox it refuses requests less than 0.7 s apart
   /data/latest.json, /data/history.json           the hourly snapshot, built with scripts/snapshot.py from the mock pools
 
 Query switches for failure drills: ?api=mock&down=rpc | explorer | api | positions (comma-separated), read from the Referer.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib.util
 import json
 import os
 import random
 import sys
+import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -230,6 +234,40 @@ def wallet_transactions(cid: int) -> list[dict]:
     return txs
 
 
+LEDGER_BULK = 520  # enough extra transactions that the ledger listing needs a second page
+
+
+@functools.lru_cache(maxsize=None)
+def ledger_transactions(cid: int) -> tuple:
+    """Everything the demo wallet sent on this chain, newest first, as (hash, block, failed)."""
+    base = CHAINS[cid][2]
+    txs = [(x["hash"], x["block_number"], x["status"] != "ok") for x in wallet_transactions(cid)]
+    txs += [("0x" + hashlib.sha256(f"bulk{cid}{k}".encode()).hexdigest(), base - 20_000 - k * 700, False) for k in range(LEDGER_BULK)]
+    return tuple(sorted(txs, key=lambda x: -x[1]))
+
+
+@functools.lru_cache(maxsize=None)
+def ledger_events(cid: int) -> tuple:
+    """3xpl's view of the demo wallet: a value event and a fee event per transaction it sent, newest first.
+
+    A reverted transaction keeps its fee event and marks the value event as failed; every ninth transaction is
+    followed by somebody else's transfer to the wallet, which has no fee event.
+    """
+    events = []
+    for n, (tx, block, failed) in enumerate(ledger_transactions(cid)):
+        common = {"block": block, "transaction": tx, "time": iso(block_ts(cid, block)), "currency": "bnb", "extra_indexed": None}
+        events.append({**common, "sort_key": 202, "effect": "-0", "failed": failed, "extra": None})
+        events.append({**common, "sort_key": 200, "effect": "-14115850000000", "failed": False, "extra": "f"})
+        if n % 9 == 0:
+            events.append({**common, "block": block - 1, "time": iso(block_ts(cid, block - 1)), "transaction": "0x" + hashlib.sha256(f"in{cid}{n}".encode()).hexdigest(), "sort_key": 7, "effect": "+250000000000000", "failed": False, "extra": None})
+    return tuple(events)
+
+
+@functools.lru_cache(maxsize=None)
+def known_hashes(cid: int) -> frozenset:
+    return frozenset(x[0] for x in ledger_transactions(cid))
+
+
 def handle_rpc(cid: int, req: dict):
     method = req.get("method")
     params = req.get("params") or []
@@ -245,8 +283,7 @@ def handle_rpc(cid: int, req: dict):
                 # a token transfer first, then the pool's event: readers must pick the Swap out of the receipt
                 transfer = {"address": p["token0"].lower(), "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", topic_addr(DEMO_WALLET), topic_addr(p["poolAddress"])], "data": "0x" + word(1), "blockNumber": hex(sw["block"]), "transactionHash": sw["tx"], "logIndex": "0x0"}
                 return {"transactionHash": sw["tx"], "blockNumber": hex(sw["block"]), "status": "0x1", "from": DEMO_WALLET, "to": ROUTER.lower(), "logs": [transfer, swap_log(p, sw, "rpc")]}
-        known = {x["hash"] for x in wallet_transactions(cid)}
-        return {"transactionHash": params[0], "status": "0x1", "logs": []} if params[0] in known else None
+        return {"transactionHash": params[0], "status": "0x1", "logs": []} if params[0] in known_hashes(cid) else None
     if method == "eth_getLogs":
         f = params[0]
         frm = int(f.get("fromBlock", "0x0"), 16)
@@ -335,6 +372,8 @@ def build_snapshot() -> tuple[dict, dict]:
 
 
 SNAPSHOT_LATEST, SNAPSHOT_HISTORY = build_snapshot()
+LEDGER_LOCK = threading.Lock()
+LEDGER_LAST = [0.0]  # when the ledger last answered: the sandbox it stands in for refuses back-to-back requests
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -342,7 +381,7 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*a, directory=ROOT, **kw)
 
     def log_message(self, fmt, *args):  # quieter: API-ish requests only
-        if any(k in str(args[0]) for k in ("/public/v1", "/rpc/", "/explorer/")):
+        if any(k in str(args[0]) for k in ("/public/v1", "/rpc/", "/explorer/", "/ledger/")):
             sys.stderr.write("%s\n" % (fmt % args))
 
     def end_headers(self):
@@ -375,12 +414,17 @@ class Handler(SimpleHTTPRequestHandler):
         ln = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(ln) or b"{}")
         if u.path.startswith("/rpc/"):
-            if "rpc" in self.down():
-                return self.send_json({"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32603, "message": "service temporarily unavailable"}})
-            res = handle_rpc(int(u.path.split("/")[2]), body)
-            if isinstance(res, dict) and "__error__" in res:
-                return self.send_json({"jsonrpc": "2.0", "id": body.get("id"), "error": res["__error__"]})
-            return self.send_json({"jsonrpc": "2.0", "id": body.get("id"), "result": res})
+            if "rpc" in self.down():  # one error object, for a batch too: what a node behind a failing gateway sends
+                return self.send_json({"jsonrpc": "2.0", "id": None if isinstance(body, list) else body.get("id"), "error": {"code": -32603, "message": "service temporarily unavailable"}})
+            cid = int(u.path.split("/")[2])
+
+            def answer(req: dict) -> dict:
+                res = handle_rpc(cid, req)
+                if isinstance(res, dict) and "__error__" in res:
+                    return {"jsonrpc": "2.0", "id": req.get("id"), "error": res["__error__"]}
+                return {"jsonrpc": "2.0", "id": req.get("id"), "result": res}
+
+            return self.send_json([answer(r) for r in body] if isinstance(body, list) else answer(body))
         return self.send_json({"error": "not found"}, 404)
 
     def do_GET(self):
@@ -393,6 +437,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.explorer(int(parts[1]), q)
         if len(parts) == 7 and parts[0] == "explorer" and parts[2:5] == ["api", "v2", "addresses"] and parts[6] == "transactions":
             return self.explorer_transactions(int(parts[1]), parts[5], q)
+        if len(parts) == 4 and parts[0] == "ledger" and parts[2] == "address":
+            return self.ledger(int(parts[1]), parts[3], q)
         if parts[:2] == ["public", "v1"]:
             if "api" in self.down():
                 return self.send_json({"error": "upstream unavailable"}, 503)
@@ -424,6 +470,32 @@ class Handler(SimpleHTTPRequestHandler):
         page = txs[:50]
         nxt = {"block_number": page[-1]["block_number"], "index": 0, "items_count": 50, "filter": "from"} if len(txs) > 50 else None
         return self.send_json({"items": page, "next_page_params": nxt})
+
+    def ledger(self, cid: int, address: str, q: dict):
+        """3xpl's address listing: balance events newest first; page -N is the Nth page back from the newest one."""
+        now = time.time()
+        with LEDGER_LOCK:
+            too_soon = now - LEDGER_LAST[0] < 0.7
+            LEDGER_LAST[0] = now
+        if too_soon or "explorer" in self.down():
+            body = b"<html><head><title>429 Too Many Requests</title></head><body><center><h1>429 Too Many Requests</h1></center></body></html>"
+            self.send_response(429)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return self.wfile.write(body)
+        context = {"code": 200, "request_cost": 1, "api": {"version": "3.0.0-alpha", "notice": ":)"}, "time": 0.01}
+        limit = q.get("limit", ["10"])[0]
+        if limit not in ("1", "10", "100", "1000"):
+            return self.send_json({"data": "`limit`  param can only be one of these: 1, 10, 100, 1000", "context": {**context, "code": 400}}, 400)
+        module = q.get("from", ["bnb-main"])[0]
+        page = q.get("page", ["-0"])[0]
+        events = list(ledger_events(cid)) if address.lower() == DEMO_WALLET else []
+        if not page.startswith("-"):
+            events.reverse()  # positive pages count from the oldest event
+        start = abs(int(page)) * int(limit)
+        return self.send_json({"data": {"events": {module: events[start:start + int(limit)]}}, "context": context})
 
     def api(self, rest: list[str], q: dict):
         if rest == ["chains"]:

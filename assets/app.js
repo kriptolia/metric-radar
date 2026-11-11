@@ -10,6 +10,7 @@
   const PULSE_SECONDS = 900;
   const TRADE_WINDOWS = { "15m": 900, "1h": 3600, "3h": 10800 };
   const PERIODS = ["24h", "7d", "30d", "all"];
+  const WALLET_ROWS = 200; // swaps listed in the wallet's table; the totals above it always cover every swap
 
   // ---------- state ----------
   const S = {
@@ -974,7 +975,7 @@
       }
       return { ts: isFinite(ts) ? ts - 3600 : 0, block: isFinite(block) ? block : 0 };
     }
-    /** Positions (Metric API) and swap history (explorer + chain) of one address. Never rejects: failures are listed in the result. */
+    /** Positions (Metric API) and swap history (explorer or ledger + chain) of one address. Never rejects: failures are listed in the result. */
     function lookup(addr) {
       if (W.pending && W.pending.addr === addr) return W.pending.promise; // a redraw joins the lookup already in flight
       const promise = (async () => {
@@ -1057,8 +1058,9 @@
         MR.barRows(bc, byChain, fmtUsd);
         MR.barRows(bp, [...agg.values()].sort((a, b) => b.usd - a.usd).slice(0, 10).map((a) => ({ label: a.label, sub: chainName(a.chainId) + " · " + fmtInt(a.n), value: a.usd, color: SERIES[a.chainId], href: "#/pool/" + a.chainId + "/" + a.pool })), fmtUsd);
         swapSection.appendChild(h("div", { class: "grid-2 plain" }, h("div", null, h("h3", null, t("wallet.byChain")), bc), h("div", null, h("h3", null, t("wallet.byPool")), bp)));
+        if (swaps.length > WALLET_ROWS) swapSection.appendChild(h("p", { class: "hint" }, t("wallet.tableHint", { n: fmtInt(swaps.length), shown: fmtInt(WALLET_ROWS) })));
         swapSection.appendChild(table([{ label: t("wallet.swapCols.time") }, { label: t("wallet.swapCols.chain") }, { label: t("wallet.swapCols.pool") }, { label: t("wallet.swapCols.side") }, { label: t("wallet.swapCols.in"), num: true }, { label: t("wallet.swapCols.out"), num: true }, { label: t("wallet.swapCols.usd"), num: true }, { label: t("wallet.swapCols.tx") }],
-          swaps.slice(0, 200).map((s) => h("tr", null, td(s.ts ? fmtDate(s.ts, true) : "#" + fmtInt(s.block), "num"), td(chainChip(s.chainId)), td(h("a", { href: "#/pool/" + s.chainId + "/" + s.pool }, s.pair)), td(sideCell(s)), td(fmtNum(s.amountIn) + " " + s.tokIn.sym, "num"), td(fmtNum(s.amountOut) + " " + s.tokOut.sym, "num"), td(fmtUsd(s.usd), "num"), td(h("a", { href: explorerTx(s.chainId, s.tx), target: "_blank", rel: "noopener" }, short(s.tx, 3))))),
+          swaps.slice(0, WALLET_ROWS).map((s) => h("tr", null, td(s.ts ? fmtDate(s.ts, true) : "#" + fmtInt(s.block), "num"), td(chainChip(s.chainId)), td(h("a", { href: "#/pool/" + s.chainId + "/" + s.pool }, s.pair)), td(sideCell(s)), td(fmtNum(s.amountIn) + " " + s.tokIn.sym, "num"), td(fmtNum(s.amountOut) + " " + s.tokOut.sym, "num"), td(fmtUsd(s.usd), "num"), td(h("a", { href: explorerTx(s.chainId, s.tx), target: "_blank", rel: "noopener" }, short(s.tx, 3))))),
           { cls: "compact" }));
       } else if (swapChains) swapSection.appendChild(empty(t("wallet.noSwaps")));
       out.appendChild(swapSection);
